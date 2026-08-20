@@ -1,0 +1,243 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Zero Device — POS System</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/qrcodejs@1.0.0/qrcode.min.js"></script>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.1/css/all.min.css">
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=Playfair+Display:wght@600;700&display=swap" rel="stylesheet">
+    <script>
+        tailwind.config = {
+            theme: {
+                extend: {
+                    colors: {
+                        primary: {
+                            50: '#f0f7ff',
+                            100: '#e0effe',
+                            200: '#b9dffd',
+                            300: '#7cc5fb',
+                            400: '#36a7f6',
+                            500: '#0c8ce9',
+                            600: '#006fc7',
+                            700: '#0158a1',
+                            800: '#064b85',
+                            900: '#0b3f6e',
+                            950: '#072849'
+                        },
+                        accent: {
+                            50: '#f8f7f4',
+                            100: '#efede6',
+                            200: '#ddd8cc',
+                            300: '#c7beab',
+                            400: '#b0a38b',
+                            500: '#9c8c72',
+                            600: '#8a7960',
+                            700: '#726350',
+                            800: '#5f5344',
+                            900: '#50463a'
+                        }
+                    },
+                    fontFamily: {
+                        sans: ['Inter', 'system-ui', 'sans-serif'],
+                        display: ['Playfair Display', 'serif']
+                    },
+                    boxShadow: {
+                        'soft': '0 2px 15px -3px rgba(0, 0, 0, 0.07), 0 10px 20px -2px rgba(0, 0, 0, 0.04)',
+                        'premium': '0 4px 25px -5px rgba(0, 0, 0, 0.1), 0 10px 10px -5px rgba(0, 0, 0, 0.04)',
+                        'card': '0 1px 3px 0 rgba(0, 0, 0, 0.05), 0 1px 2px 0 rgba(0, 0, 0, 0.03)'
+                    },
+                    animation: {
+                        'fade-in': 'fadeIn 0.4s ease-out',
+                        'slide-up': 'slideUp 0.4s ease-out',
+                        'slide-in-right': 'slideInRight 0.3s ease-out',
+                        'scale-in': 'scaleIn 0.3s ease-out',
+                        'pulse-soft': 'pulseSoft 2s infinite'
+                    },
+                    keyframes: {
+                        fadeIn: {
+                            '0%': { opacity: '0' },
+                            '100%': { opacity: '1' }
+                        },
+                        slideUp: {
+                            '0%': { opacity: '0', transform: 'translateY(20px)' },
+                            '100%': { opacity: '1', transform: 'translateY(0)' }
+                        },
+                        slideInRight: {
+                            '0%': { opacity: '0', transform: 'translateX(20px)' },
+                            '100%': { opacity: '1', transform: 'translateX(0)' }
+                        },
+                        scaleIn: {
+                            '0%': { opacity: '0', transform: 'scale(0.95)' },
+                            '100%': { opacity: '1', transform: 'scale(1)' }
+                        },
+                        pulseSoft: {
+                            '0%, 100%': { opacity: '1' },
+                            '50%': { opacity: '0.7' }
+                        }
+                    }
+                }
+            }
+        }
+    </script>
+    <link rel="stylesheet" href="style.css">
+</head>
+<body class="bg-slate-50 text-slate-800 antialiased">
+    <!-- Loading Screen -->
+    <div id="loading-screen" class="fixed inset-0 z-[100] bg-white flex flex-col items-center justify-center">
+        <div class="text-center animate-fade-in">
+            <div class="w-20 h-20 mx-auto mb-6 rounded-2xl bg-gradient-to-br from-primary-500 to-primary-700 flex items-center justify-center shadow-premium">
+                <i class="fas fa-laptop text-white text-3xl"></i>
+            </div>
+            <h1 class="font-display text-3xl font-bold text-slate-800 mb-2">Zero Device'S</h1>
+            <p class="text-slate-500 text-sm mb-8">Premium POS System</p>
+            <div class="loading-spinner mx-auto"></div>
+        </div>
+    </div>
+
+    <!-- Login Screen -->
+    <div id="login-screen" class="fixed inset-0 z-50 hidden bg-gradient-to-br from-slate-100 via-white to-primary-50 flex items-center justify-center p-4">
+        <div class="w-full max-w-md animate-scale-in">
+            <div class="bg-white rounded-2xl shadow-premium p-8 border border-slate-100">
+                <div class="text-center mb-8">
+                    <div class="w-16 h-16 mx-auto mb-4 rounded-xl bg-gradient-to-br from-primary-500 to-primary-700 flex items-center justify-center shadow-lg">
+                        <i class="fas fa-laptop text-white text-2xl"></i>
+                    </div>
+                    <h1 class="font-display text-2xl font-bold text-slate-800">Zero Device'S</h1>
+                    <p class="text-slate-500 text-sm mt-1">Sign in to your POS system</p>
+                </div>
+                
+                <form id="login-form" class="space-y-5">
+                    <div>
+                        <label class="block text-sm font-medium text-slate-700 mb-1.5">Username</label>
+                        <div class="relative">
+                            <span class="absolute left-3 top-1/2 -translate-y-1/2 text-slate-400">
+                                <i class="fas fa-user"></i>
+                            </span>
+                            <input type="text" id="login-username" required
+                                class="w-full pl-10 pr-4 py-2.5 rounded-lg border border-slate-200 bg-slate-50 focus:bg-white transition-colors"
+                                placeholder="Enter username" autocomplete="username">
+                        </div>
+                    </div>
+                    <div>
+                        <label class="block text-sm font-medium text-slate-700 mb-1.5">Password</label>
+                        <div class="relative">
+                            <span class="absolute left-3 top-1/2 -translate-y-1/2 text-slate-400">
+                                <i class="fas fa-lock"></i>
+                            </span>
+                            <input type="password" id="login-password" required
+                                class="w-full pl-10 pr-4 py-2.5 rounded-lg border border-slate-200 bg-slate-50 focus:bg-white transition-colors"
+                                placeholder="Enter password" autocomplete="current-password">
+                        </div>
+                    </div>
+                    <button type="submit" class="w-full btn-primary text-white font-medium py-2.5 rounded-lg">
+                        <i class="fas fa-sign-in-alt mr-2"></i>Sign In
+                    </button>
+                </form>
+                
+                <p class="text-center text-xs text-slate-400 mt-6">
+                    Default: <span class="font-medium text-slate-500">admin / admin123</span>
+                </p>
+            </div>
+        </div>
+    </div>
+
+    <!-- Main App -->
+    <div id="main-app" class="hidden min-h-screen flex">
+        <!-- Sidebar -->
+        <aside id="sidebar" class="w-64 bg-white border-r border-slate-200 flex flex-col fixed h-full z-40 shadow-soft">
+            <div class="p-5 border-b border-slate-100">
+                <div class="flex items-center gap-3">
+                    <div class="w-10 h-10 rounded-xl bg-gradient-to-br from-primary-500 to-primary-700 flex items-center justify-center shadow-md">
+                        <i class="fas fa-laptop text-white text-lg"></i>
+                    </div>
+                    <div>
+                        <h1 class="font-display font-bold text-lg text-slate-800 leading-tight">Zero Device'S</h1>
+                        <p class="text-xs text-slate-400">POS System</p>
+                    </div>
+                </div>
+            </div>
+            
+            <nav class="flex-1 p-3 space-y-1 overflow-y-auto">
+                <button data-page="dashboard" class="sidebar-item active w-full flex items-center gap-3 px-3 py-2.5 rounded-lg text-sm font-medium text-left">
+                    <i class="fas fa-chart-pie w-5 text-center"></i>
+                    <span>Dashboard</span>
+                </button>
+                <button data-page="billing" class="sidebar-item w-full flex items-center gap-3 px-3 py-2.5 rounded-lg text-sm font-medium text-slate-600 text-left">
+                    <i class="fas fa-cash-register w-5 text-center"></i>
+                    <span>Billing</span>
+                </button>
+                <button data-page="inventory" class="sidebar-item w-full flex items-center gap-3 px-3 py-2.5 rounded-lg text-sm font-medium text-slate-600 text-left">
+                    <i class="fas fa-boxes-stacked w-5 text-center"></i>
+                    <span>Inventory</span>
+                </button>
+                <button data-page="customers" class="sidebar-item w-full flex items-center gap-3 px-3 py-2.5 rounded-lg text-sm font-medium text-slate-600 text-left">
+                    <i class="fas fa-users w-5 text-center"></i>
+                    <span>Customers</span>
+                </button>
+                <button data-page="sales" class="sidebar-item w-full flex items-center gap-3 px-3 py-2.5 rounded-lg text-sm font-medium text-slate-600 text-left">
+                    <i class="fas fa-receipt w-5 text-center"></i>
+                    <span>Sales History</span>
+                </button>
+                <button data-page="settings" class="sidebar-item w-full flex items-center gap-3 px-3 py-2.5 rounded-lg text-sm font-medium text-slate-600 text-left">
+                    <i class="fas fa-cog w-5 text-center"></i>
+                    <span>Settings</span>
+                </button>
+            </nav>
+            
+            <div class="p-4 border-t border-slate-100">
+                <div class="flex items-center gap-3 mb-3">
+                    <div class="w-9 h-9 rounded-full bg-primary-100 flex items-center justify-center">
+                        <i class="fas fa-user text-primary-600 text-sm"></i>
+                    </div>
+                    <div class="flex-1 min-w-0">
+                        <p id="current-user-name" class="text-sm font-medium text-slate-800 truncate">Admin</p>
+                        <p class="text-xs text-slate-400">Logged in</p>
+                    </div>
+                </div>
+                <button id="logout-btn" class="w-full flex items-center justify-center gap-2 px-3 py-2 rounded-lg text-sm font-medium text-red-600 hover:bg-red-50 transition-colors">
+                    <i class="fas fa-sign-out-alt"></i>
+                    <span>Logout</span>
+                </button>
+            </div>
+        </aside>
+
+        <!-- Main Content -->
+        <main class="flex-1 ml-64 min-h-screen">
+            <!-- Top Bar -->
+            <header class="sticky top-0 z-30 bg-white/80 backdrop-blur-md border-b border-slate-200 px-6 py-3 flex items-center justify-between">
+                <div>
+                    <h2 id="page-title" class="text-xl font-semibold text-slate-800">Dashboard</h2>
+                    <p id="page-subtitle" class="text-sm text-slate-500">Overview of your business</p>
+                </div>
+                <div class="flex items-center gap-4">
+                    <div class="text-right hidden sm:block">
+                        <p id="current-date" class="text-sm font-medium text-slate-700"></p>
+                        <p id="current-time" class="text-xs text-slate-400"></p>
+                    </div>
+                    <div class="w-px h-8 bg-slate-200"></div>
+                    <button id="quick-bill-btn" class="btn-primary text-white text-sm font-medium px-4 py-2 rounded-lg flex items-center gap-2">
+                        <i class="fas fa-plus"></i>
+                        <span>New Bill</span>
+                    </button>
+                </div>
+            </header>
+
+            <!-- Page Content -->
+            <div id="page-content" class="p-6">
+                <!-- Pages will be injected here -->
+            </div>
+        </main>
+    </div>
+
+    <!-- Toast Container -->
+    <div id="toast-container" class="fixed top-4 right-4 z-[90] space-y-2"></div>
+
+    <!-- Modal Container -->
+    <div id="modal-container"></div>
+
+    <script src="script.js"></script>
+</body>
+</html>
