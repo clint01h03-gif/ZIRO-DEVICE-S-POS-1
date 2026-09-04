@@ -608,7 +608,7 @@
 
     <script>
         // ==================== DATA & STATE ====================
-        const APP_VERSION = '1.3.0';
+        const APP_VERSION = '1.4.0';
 
         const STORAGE_KEY = 'zero_device_pos_data';
         
@@ -918,30 +918,113 @@
         }
 
         async function pushSnapshotToFirebase() {
+            // legacy name — now collection-based full push
+            return pushAllCollectionsToFirebase();
+        }
+
+        async function pushAllCollectionsToFirebase() {
             if (!state.settings.firebase?.connected) return false;
-            const snap = getPosSnapshot();
-            const light = JSON.parse(JSON.stringify(snap));
-            if (light.warranties) light.warranties.forEach(w => { delete w.pageHtml; });
+            const cfg = state.settings.firebase.config;
             try {
-                await firestoreSetDocument('pos_data', 'main', { ...light, syncedAt: new Date().toISOString() });
+                // Meta snapshot: counters, settings, users (small)
+                const meta = {
+                    settings: { ...state.settings },
+                    users: state.users,
+                    nextProductId: state.nextProductId,
+                    nextBillId: state.nextBillId,
+                    nextCustomerId: state.nextCustomerId,
+                    nextWarrantyId: state.nextWarrantyId,
+                    syncedAt: new Date().toISOString(),
+                    version: APP_VERSION
+                };
+                // don't nest firebase passwords issues — settings includes firebase config (needed)
+                await firestoreSetDocument('pos_data', 'main', meta, cfg);
+
+                // Products
+                for (const p of state.products) {
+                    await firestoreSetDocument('products', String(p.id), stripHeavyFields(p), cfg);
+                }
+                // Customers
+                for (const c of state.customers) {
+                    await firestoreSetDocument('customers', String(c.id), c, cfg);
+                }
+                // Bills
+                for (const b of state.bills) {
+                    await firestoreSetDocument('bills', String(b.id), stripHeavyFields(b), cfg);
+                }
+                // Warranties (also keep warranties/{billWarrantyCode} for QR)
+                for (const w of state.warranties) {
+                    await firestoreSetDocument('warranty_items', String(w.code || w.id), stripHeavyFields(w), cfg);
+                }
                 return true;
             } catch (err) {
-                try {
-                    const lighter = JSON.parse(JSON.stringify(light));
-                    (lighter.products || []).forEach(p => {
-                        if (p.image && String(p.image).startsWith('data:')) p.image = '';
-                    });
-                    (lighter.bills || []).forEach(b => {
-                        (b.items || []).forEach(it => {
-                            if (it.image && String(it.image).startsWith('data:')) it.image = '';
-                        });
-                    });
-                    await firestoreSetDocument('pos_data', 'main', { ...lighter, syncedAt: new Date().toISOString(), imagesStripped: true });
+                console.warn('Collection push failed', err);
+                showToast('Firebase save fail: ' + (err.message || 'error'), 'error');
+                return false;
+            }
+        }
+
+        async function pullAllCollectionsFromFirebase(mode) {
+            mode = mode || 'merge';
+            if (!state.settings.firebase?.config?.projectId) return false;
+            const cfg = state.settings.firebase.config;
+            try {
+                const meta = await firestoreGetDocument('pos_data', 'main', cfg);
+                let products = [], customers = [], bills = [], warranties = [];
+                try { products = await firestoreListDocuments('products', cfg); } catch (e) { console.warn('products list', e); }
+                try { customers = await firestoreListDocuments('customers', cfg); } catch (e) { console.warn('customers list', e); }
+                try { bills = await firestoreListDocuments('bills', cfg); } catch (e) { console.warn('bills list', e); }
+                try { warranties = await firestoreListDocuments('warranty_items', cfg); } catch (e) { console.warn('warranty_items list', e); }
+
+                // Fallback: old single snapshot format
+                if (!products.length && !bills.length && meta && meta.products) {
+                    applyRemoteSnapshot(meta, mode);
+                    saveData({ skipCloud: true });
                     return true;
-                } catch (err2) {
-                    console.warn('Full cloud sync failed', err2);
-                    return false;
                 }
+
+                const remote = {
+                    products,
+                    customers,
+                    bills,
+                    warranties,
+                    users: (meta && meta.users) || [],
+                    settings: (meta && meta.settings) || null,
+                    nextProductId: meta?.nextProductId,
+                    nextBillId: meta?.nextBillId,
+                    nextCustomerId: meta?.nextCustomerId,
+                    nextWarrantyId: meta?.nextWarrantyId
+                };
+
+                if (mode === 'replace') {
+                    if (products.length) state.products = products;
+                    if (customers.length) state.customers = customers;
+                    if (bills.length) state.bills = bills;
+                    if (warranties.length) state.warranties = warranties;
+                    if (remote.users && remote.users.length) state.users = remote.users;
+                } else {
+                    state.products = mergeById(state.products, products, 'id');
+                    state.customers = mergeById(state.customers, customers, 'id');
+                    state.bills = mergeById(state.bills, bills, 'id');
+                    state.warranties = mergeWarranties(state.warranties, warranties);
+                    if (remote.users && remote.users.length) state.users = mergeById(state.users, remote.users, 'id');
+                }
+                if (remote.settings) {
+                    const fbKeep = state.settings.firebase;
+                    const { firebase: _d, ...rest } = remote.settings;
+                    state.settings = { ...state.settings, ...rest, firebase: fbKeep };
+                }
+                if (remote.nextProductId) state.nextProductId = Math.max(state.nextProductId || 1, remote.nextProductId);
+                if (remote.nextBillId) state.nextBillId = Math.max(state.nextBillId || 1, remote.nextBillId);
+                if (remote.nextCustomerId) state.nextCustomerId = Math.max(state.nextCustomerId || 1, remote.nextCustomerId);
+                if (remote.nextWarrantyId) state.nextWarrantyId = Math.max(state.nextWarrantyId || 1, remote.nextWarrantyId);
+
+                saveData({ skipCloud: true });
+                _lastCloudPullAt = Date.now();
+                return true;
+            } catch (err) {
+                console.warn('pull collections failed', err);
+                return false;
             }
         }
 
@@ -954,19 +1037,11 @@
             if (_cloudSyncLock) return false;
             _cloudSyncLock = true;
             try {
-                // 1) Pull cloud first
-                try {
-                    const data = await firestoreGetDocument('pos_data', 'main');
-                    if (data) applyRemoteSnapshot(data, 'merge');
-                } catch (e) {
-                    console.warn('pre-push pull failed', e);
-                }
-                // 2) Save merged local
+                await pullAllCollectionsFromFirebase('merge');
                 try {
                     localStorage.setItem(STORAGE_KEY, JSON.stringify(getPosSnapshot()));
                 } catch (_) {}
-                // 3) Push merged
-                const ok = await pushSnapshotToFirebase();
+                const ok = await pushAllCollectionsToFirebase();
                 _lastCloudPullAt = Date.now();
                 return ok;
             } finally {
@@ -975,34 +1050,19 @@
         }
 
         async function loadAllDataFromFirebase(mode) {
-            // mode default merge for multi-device; 'replace' only for explicit Pull button
             mode = mode || 'merge';
-            if (!state.settings.firebase?.config?.projectId) return false;
-            try {
-                const data = await firestoreGetDocument('pos_data', 'main');
-                if (!data) return false;
-                applyRemoteSnapshot(data, mode);
-                saveData({ skipCloud: true });
-                _lastCloudPullAt = Date.now();
-                return true;
-            } catch (err) {
-                console.warn('Load from Firebase failed', err);
-                return false;
-            }
+            return pullAllCollectionsFromFirebase(mode);
         }
 
         async function refreshFromCloudSilent() {
             if (!state.settings.firebase?.connected) return;
             if (_cloudSyncLock) return;
-            if (Date.now() - _lastCloudPullAt < 8000) return;
+            if (Date.now() - _lastCloudPullAt < 5000) return;
             try {
-                const data = await firestoreGetDocument('pos_data', 'main');
-                if (!data) return;
                 const billCountBefore = state.bills.length;
-                applyRemoteSnapshot(data, 'merge');
-                saveData({ skipCloud: true });
-                _lastCloudPullAt = Date.now();
-                if (state.bills.length !== billCountBefore) {
+                const productCountBefore = state.products.length;
+                await pullAllCollectionsFromFirebase('merge');
+                if (state.bills.length !== billCountBefore || state.products.length !== productCountBefore) {
                     const active = document.querySelector('.sidebar-item.active');
                     if (active && !document.getElementById('main-app').classList.contains('hidden')) {
                         navigateTo(active.dataset.page || 'dashboard');
@@ -1257,7 +1317,13 @@
         function generateInvoiceNumber() {
             const prefix = state.settings.invoicePrefix || 'ZD';
             const num = String(state.nextBillId).padStart(5, '0');
-            return `${prefix}-${num}`;
+            const rand = Math.random().toString(36).substring(2, 5).toUpperCase();
+            return `${prefix}-${num}-${rand}`;
+        }
+
+        function generateUniqueBillId() {
+            // Avoid A1/A2 collision on sequential IDs
+            return Date.now() * 1000 + Math.floor(Math.random() * 1000);
         }
 
         // ==================== MOBILE SIDEBAR ====================
@@ -1965,10 +2031,11 @@
                 if (nic) customer.nic = nic;
             }
             
-            // Create bill
+            // Create bill (unique id so multi-device never overwrites)
             const invoiceNo = generateInvoiceNumber();
+            state.nextBillId++;
             const bill = {
-                id: state.nextBillId++,
+                id: generateUniqueBillId(),
                 invoiceNo,
                 customerId: customer.id,
                 customerName: name,
@@ -1995,6 +2062,29 @@
             });
             
             state.bills.push(bill);
+
+            // Immediate cloud write for this bill (multi-device)
+            if (state.settings.firebase?.connected) {
+                (async () => {
+                    try {
+                        await firestoreSetDocument('bills', String(bill.id), stripHeavyFields(bill));
+                        for (const p of state.products) {
+                            await firestoreSetDocument('products', String(p.id), stripHeavyFields(p));
+                        }
+                        await firestoreSetDocument('customers', String(customer.id), customer);
+                        await firestoreSetDocument('pos_data', 'main', {
+                            settings: state.settings,
+                            users: state.users,
+                            nextProductId: state.nextProductId,
+                            nextBillId: state.nextBillId,
+                            nextCustomerId: state.nextCustomerId,
+                            nextWarrantyId: state.nextWarrantyId,
+                            syncedAt: new Date().toISOString(),
+                            version: APP_VERSION
+                        });
+                    } catch (e) { console.warn('immediate bill cloud write', e); }
+                })();
+            }
 
             // Create warranty records (one per line item, plus one shared code for the whole bill)
             const months = state.settings.warrantyMonths || 12;
@@ -3203,6 +3293,48 @@ ${isCancelled ? '.card{opacity:.92} .banner{background:#fef2f2;color:#b91c1c;pad
             return objectFromFirestoreFields(data.fields);
         }
 
+        async function firestoreListDocuments(collection, conf) {
+            const cfg = conf || state.settings.firebase?.config;
+            if (!cfg?.projectId || !cfg?.apiKey) throw new Error('Firebase is not connected');
+            const base = `https://firestore.googleapis.com/v1/projects/${encodeURIComponent(cfg.projectId)}/databases/(default)/documents/${encodeURIComponent(collection)}?key=${encodeURIComponent(cfg.apiKey)}&pageSize=300`;
+            let url = base;
+            const all = [];
+            for (let i = 0; i < 20; i++) {
+                const res = await fetch(url, { method: 'GET' });
+                if (!res.ok) {
+                    const errText = await res.text().catch(() => '');
+                    throw new Error(describeFirestoreError(res.status, errText));
+                }
+                const data = await res.json();
+                (data.documents || []).forEach(doc => {
+                    const fields = objectFromFirestoreFields(doc.fields || {});
+                    // attach id from name if missing
+                    if (fields.id == null && doc.name) {
+                        const parts = doc.name.split('/');
+                        fields._docId = parts[parts.length - 1];
+                    }
+                    all.push(fields);
+                });
+                if (!data.nextPageToken) break;
+                url = base + '&pageToken=' + encodeURIComponent(data.nextPageToken);
+            }
+            return all;
+        }
+
+        function stripHeavyFields(obj) {
+            const o = JSON.parse(JSON.stringify(obj));
+            if (o.pageHtml) delete o.pageHtml;
+            if (o.image && String(o.image).startsWith('data:') && String(o.image).length > 50000) {
+                o.image = ''; // keep cloud light; local still has full image
+            }
+            if (Array.isArray(o.items)) {
+                o.items.forEach(it => {
+                    if (it.image && String(it.image).startsWith('data:') && String(it.image).length > 50000) it.image = '';
+                });
+            }
+            return o;
+        }
+
         function encodeFirebaseRef(cfg) {
             try {
                 const payload = btoa(unescape(encodeURIComponent(JSON.stringify({ p: cfg.projectId, k: cfg.apiKey }))));
@@ -3750,6 +3882,18 @@ service cloud.firestore {
       allow read, write: if true;
     }
     match /pos_data/{doc} {
+      allow read, write: if true;
+    }
+    match /products/{id} {
+      allow read, write: if true;
+    }
+    match /customers/{id} {
+      allow read, write: if true;
+    }
+    match /bills/{id} {
+      allow read, write: if true;
+    }
+    match /warranty_items/{id} {
       allow read, write: if true;
     }
   }
