@@ -583,14 +583,10 @@
                 lowStockThreshold: 5,
                 theme: 'light',
                 warrantyMonths: 12,
-                warrantyBaseUrl: '',
-                googleDrive: {
-                    clientId: '',
-                    apiKey: '',
+                firebase: {
+                    config: null,      // { apiKey, projectId, authDomain, storageBucket, appId, messagingSenderId }
                     connected: false,
-                    accessToken: '',
-                    folderId: '',
-                    folderName: 'ZeroDevice-Warranties'
+                    lastConnectedAt: null
                 }
             },
 
@@ -615,6 +611,10 @@
         // ==================== INITIALIZATION ====================
         function initApp() {
             loadData();
+
+            // Public warranty QR deep link — works without login, using Firebase only.
+            // Short-circuits the whole POS app and renders just the warranty report.
+            if (tryRenderPublicWarrantyLink()) return;
             
             // Ensure default admin exists
             if (state.users.length === 0) {
@@ -634,9 +634,6 @@
                 seedSampleData();
             }
             
-            // Handle Google OAuth token return & warranty deep links
-            handleGoogleOAuthCallback();
-
             setTimeout(() => {
                 document.getElementById('loading-screen').classList.add('hidden');
                 checkAuth();
@@ -719,16 +716,12 @@
                     if (!state.settings.warrantyMonths) {
                         state.settings.warrantyMonths = 12;
                     }
-                    if (!state.settings.googleDrive) {
-                        state.settings.googleDrive = {
-                            clientId: '',
-                            apiKey: '',
-                            connected: false,
-                            accessToken: '',
-                            folderId: '',
-                            folderName: 'ZeroDevice-Warranties'
-                        };
+                    if (!state.settings.firebase) {
+                        state.settings.firebase = { config: null, connected: false, lastConnectedAt: null };
                     }
+                    // Drop legacy Google Drive / QR base URL settings from older saves
+                    delete state.settings.googleDrive;
+                    delete state.settings.warrantyBaseUrl;
                     if (!state.warranties) state.warranties = [];
                     if (!state.nextWarrantyId) state.nextWarrantyId = 1;
                     // Migrate older bills without paymentStatus
@@ -1703,9 +1696,11 @@
             
             state.bills.push(bill);
 
-            // Create warranty records (one per line item with unique page code)
+            // Create warranty records (one per line item, plus one shared code for the whole bill)
             const months = state.settings.warrantyMonths || 12;
             const warrantyCodes = [];
+            bill.billWarrantyCode = generateBillWarrantyCode(bill);
+            bill.firebaseSynced = false;
             bill.items.forEach(item => {
                 for (let q = 0; q < item.qty; q++) {
                     const code = generateWarrantyCode();
@@ -1715,6 +1710,7 @@
                     const warranty = {
                         id: state.nextWarrantyId++,
                         code,
+                        billWarrantyCode: bill.billWarrantyCode,
                         billId: bill.id,
                         invoiceNo: bill.invoiceNo,
                         productId: item.productId,
@@ -1734,14 +1730,12 @@
                         endDate: end.toISOString(),
                         months,
                         status: 'Active', // Active | Cancelled | Expired
-                        driveFileId: '',
-                        driveUrl: '',
                         pageHtml: '',
                         createdAt: new Date().toISOString(),
                         cancelledAt: null,
                         cancelReason: ''
                     };
-                    // Build standalone warranty page HTML (stored for Drive upload / local view)
+                    // Build standalone warranty page HTML for local/offline viewing & download
                     warranty.pageHtml = buildWarrantyPageHtml(warranty);
                     state.warranties.push(warranty);
                     warrantyCodes.push(code);
@@ -1749,20 +1743,21 @@
             });
             bill.warrantyCodes = warrantyCodes;
 
-            // Try upload warranty pages to Google Drive if connected
-            if (state.settings.googleDrive?.connected && state.settings.googleDrive?.accessToken) {
-                uploadWarrantiesToDrive(bill.warrantyCodes).catch(err => {
-                    console.warn('Drive upload failed', err);
-                    showToast('Warranty pages saved locally (Drive upload failed)', 'warning');
-                });
-            }
-
             saveData();
+
+            (async () => {
+                if (state.settings.firebase?.connected) {
+                    const ok = await syncBillWarrantyToFirebase(bill);
+                    if (!ok) {
+                        showToast('Invoice ready — Firebase warranty sync fail. Settings la connection check pannunga', 'warning');
+                    }
+                } else {
+                    showToast('Firebase not connected — Settings la connect pannunga, illana warranty QR work aagathu', 'warning');
+                }
+                showInvoice(bill);
+                showToast('Invoice & warranty generated!', 'success');
+            })();
             
-            // Show invoice (QR opens warranty page)
-            showInvoice(bill);
-            
-            // Reset
             billingCart = [];
             updateCartUI();
             document.getElementById('bill-customer-name').value = '';
@@ -1770,8 +1765,6 @@
             document.getElementById('bill-customer-mobile').value = '';
             document.getElementById('cart-discount').value = 0;
             filterBillingProducts();
-            
-            showToast('Invoice & warranty generated!', 'success');
         }
 
         function generateWarrantyCode() {
@@ -1780,15 +1773,31 @@
             return `ZD-W-${n}-${rand}`;
         }
 
+        // One unique code per bill — this is what the invoice QR encodes.
+        function generateBillWarrantyCode(bill) {
+            const n = String(bill.id).padStart(5, '0');
+            const rand = Math.random().toString(36).substring(2, 7).toUpperCase();
+            return `ZD-WB-${n}-${rand}`;
+        }
+
         function getWarrantyQrContent(bill) {
-            // Prefer first warranty's Drive URL, else local viewer hash URL
-            const codes = bill.warrantyCodes || [];
-            if (!codes.length) return state.settings.businessWebsite || 'https://www.zerodevice.lk';
-            const w = state.warranties.find(x => x.code === codes[0]);
-            if (w && w.driveUrl) return w.driveUrl;
-            // Local fallback: unique page identifier that opens warranty viewer
-            const base = state.settings.warrantyBaseUrl || (window.location.href.split('#')[0].split('?')[0]);
-            return `${base}#warranty/${codes[0]}`;
+            if (!bill.billWarrantyCode) return state.settings.businessWebsite || 'https://www.zerodevice.lk';
+            const fb = state.settings.firebase;
+            if (!fb?.config?.projectId || !fb?.config?.apiKey) {
+                return state.settings.businessWebsite || state.settings.businessName || 'Connect Firebase in Settings';
+            }
+            if (!fb.connected) {
+                return state.settings.businessWebsite || 'Connect Firebase in Settings for warranty QR';
+            }
+            let base = window.location.href.split('#')[0].split('?')[0];
+            if (base.startsWith('file:')) {
+                const site = (state.settings.businessWebsite || '').trim();
+                if (site && !site.startsWith('file:')) {
+                    base = site.startsWith('http') ? site : ('https://' + site);
+                }
+            }
+            const ref = encodeFirebaseRef(fb.config);
+            return `${base}?fb=${ref}#warranty/${bill.billWarrantyCode}`;
         }
 
         function getQrCodeContent() {
@@ -2606,7 +2615,7 @@
                 <tr class="table-row border-b border-slate-50">
                     <td class="px-4 py-3">
                         <p class="text-sm font-mono font-semibold text-primary-700">${w.code}</p>
-                        ${w.driveUrl ? `<a href="${w.driveUrl}" target="_blank" class="text-[10px] text-primary-500 hover:underline">Drive page</a>` : '<span class="text-[10px] text-slate-400">Local page</span>'}
+                        ${(() => { const b = state.bills.find(bl => bl.id === w.billId); return b?.firebaseSynced ? '<span class="text-[10px] text-emerald-600"><i class="fas fa-cloud mr-0.5"></i>Synced to Firebase</span>' : '<span class="text-[10px] text-slate-400">Local only</span>'; })()}
                     </td>
                     <td class="px-4 py-3">
                         <div class="flex items-center gap-2">
@@ -2670,32 +2679,35 @@
             document.getElementById('warranty-table-body').innerHTML = renderWarrantyRows(list);
         }
 
-        function cancelWarranty(code) {
+        async function cancelWarranty(code) {
             const w = state.warranties.find(x => x.code === code);
             if (!w || w.status !== 'Active') return;
             const reason = prompt('Cancel reason (optional):') || '';
-            if (!confirm(`Cancel warranty ${code}? This will also mark it cancelled on the warranty page.`)) return;
+            if (!confirm(`Cancel warranty ${code}? Customer scan pannalum CANCELLED nu show aagum.`)) return;
             w.status = 'Cancelled';
             w.cancelledAt = new Date().toISOString();
             w.cancelReason = reason;
-            w.pageHtml = buildWarrantyPageHtml(w); // rebuild page reflecting cancel
-            // Re-upload to Drive if connected
-            if (state.settings.googleDrive?.connected && state.settings.googleDrive?.accessToken) {
-                uploadSingleWarrantyToDrive(w).catch(() => {});
-            }
+            w.pageHtml = buildWarrantyPageHtml(w);
             saveData();
-            showToast(`Warranty ${code} cancelled`, 'success');
+            if (state.settings.firebase?.connected && w.billId) {
+                const bill = state.bills.find(b => b.id === w.billId);
+                if (bill) {
+                    const ok = await syncBillWarrantyToFirebase(bill);
+                    if (ok) showToast(`Warranty ${code} cancelled & Firebase update aachu`, 'success');
+                    else showToast(`Warranty ${code} cancelled locally — Firebase sync fail`, 'warning');
+                } else {
+                    showToast(`Warranty ${code} cancelled`, 'success');
+                }
+            } else {
+                showToast(`Warranty ${code} cancelled (Firebase not connected)`, 'warning');
+            }
             renderWarranty();
         }
 
         function viewWarrantyPage(code) {
             const w = state.warranties.find(x => x.code === code);
             if (!w) return;
-            if (w.driveUrl) {
-                window.open(w.driveUrl, '_blank');
-                return;
-            }
-            // Open local standalone page in new window
+            // Open local standalone page in new window (works offline)
             const win = window.open('', '_blank');
             if (win) {
                 win.document.write(w.pageHtml || buildWarrantyPageHtml(w));
@@ -2777,158 +2789,454 @@ ${isCancelled ? '.card{opacity:.92} .banner{background:#fef2f2;color:#b91c1c;pad
 </body></html>`;
         }
 
-        // Google Drive helpers (client-side OAuth + upload)
-        async function uploadWarrantiesToDrive(codes) {
-            for (const code of codes) {
-                const w = state.warranties.find(x => x.code === code);
-                if (w) await uploadSingleWarrantyToDrive(w);
-            }
-            saveData();
+        // ==================== FIREBASE (warranty online storage only) ====================
+        // Uses Cloud Firestore REST API only (no Firebase SDK). Only warranty reports are stored online.
+
+        function firestoreValueFromJs(v) {
+            if (v === null || v === undefined) return { nullValue: null };
+            if (typeof v === 'string') return { stringValue: v };
+            if (typeof v === 'number') return Number.isInteger(v) ? { integerValue: String(v) } : { doubleValue: v };
+            if (typeof v === 'boolean') return { booleanValue: v };
+            if (Array.isArray(v)) return { arrayValue: { values: v.map(firestoreValueFromJs) } };
+            if (typeof v === 'object') return { mapValue: { fields: firestoreFieldsFromObject(v) } };
+            return { stringValue: String(v) };
+        }
+        function firestoreFieldsFromObject(obj) {
+            const fields = {};
+            Object.keys(obj || {}).forEach(k => { fields[k] = firestoreValueFromJs(obj[k]); });
+            return fields;
+        }
+        function firestoreValueToJs(v) {
+            if (!v) return null;
+            if ('stringValue' in v) return v.stringValue;
+            if ('integerValue' in v) return parseInt(v.integerValue, 10);
+            if ('doubleValue' in v) return v.doubleValue;
+            if ('booleanValue' in v) return v.booleanValue;
+            if ('nullValue' in v) return null;
+            if ('arrayValue' in v) return (v.arrayValue.values || []).map(firestoreValueToJs);
+            if ('mapValue' in v) return objectFromFirestoreFields(v.mapValue.fields);
+            return null;
+        }
+        function objectFromFirestoreFields(fields) {
+            const obj = {};
+            Object.keys(fields || {}).forEach(k => { obj[k] = firestoreValueToJs(fields[k]); });
+            return obj;
         }
 
-        async function uploadSingleWarrantyToDrive(w) {
-            const gd = state.settings.googleDrive;
-            if (!gd?.accessToken) throw new Error('Not connected');
-            const html = w.pageHtml || buildWarrantyPageHtml(w);
-            const metadata = {
-                name: `warranty_${w.code}.html`,
-                mimeType: 'text/html',
-                parents: gd.folderId ? [gd.folderId] : undefined
-            };
-            const boundary = '-------zdboundary' + Date.now();
-            const delimiter = '\r\n--' + boundary + '\r\n';
-            const closeDelim = '\r\n--' + boundary + '--';
-            const body =
-                delimiter +
-                'Content-Type: application/json; charset=UTF-8\r\n\r\n' +
-                JSON.stringify(metadata) +
-                delimiter +
-                'Content-Type: text/html\r\n\r\n' +
-                html +
-                closeDelim;
+        function firestoreDocUrl(conf, collection, docId) {
+            return `https://firestore.googleapis.com/v1/projects/${encodeURIComponent(conf.projectId)}/databases/(default)/documents/${encodeURIComponent(collection)}/${encodeURIComponent(docId)}?key=${encodeURIComponent(conf.apiKey)}`;
+        }
+        function firestoreCreateUrl(conf, collection, docId) {
+            return `https://firestore.googleapis.com/v1/projects/${encodeURIComponent(conf.projectId)}/databases/(default)/documents/${encodeURIComponent(collection)}?documentId=${encodeURIComponent(docId)}&key=${encodeURIComponent(conf.apiKey)}`;
+        }
 
-            let url = 'https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart&fields=id,webViewLink,webContentLink';
-            let method = 'POST';
-            if (w.driveFileId) {
-                url = `https://www.googleapis.com/upload/drive/v3/files/${w.driveFileId}?uploadType=multipart&fields=id,webViewLink,webContentLink`;
-                method = 'PATCH';
+        function describeFirestoreError(status, raw) {
+            let detail = '';
+            try {
+                const j = JSON.parse(raw);
+                detail = j?.error?.message || '';
+            } catch (_) { detail = (raw || '').slice(0, 200); }
+            if (status === 403) {
+                return 'Permission denied (403). In Firebase Console → Firestore → Rules, allow read/write for warranties and _meta (see Settings help). Also enable Cloud Firestore API.';
             }
+            if (status === 404) {
+                return 'Firestore not found (404). Create a Firestore database: Build → Firestore Database → Create database (start in test mode).';
+            }
+            if (status === 400) {
+                return detail || 'Invalid request (400). Check Project ID and API Key from Firebase Console.';
+            }
+            if (status === 0 || status === 429) {
+                return 'Network error — check internet connection and that this page is opened via http/https (not file://).';
+            }
+            return detail ? `Firestore error (${status}): ${detail}` : `Firestore error (${status})`;
+        }
 
-            const res = await fetch(url, {
-                method,
-                headers: {
-                    'Authorization': 'Bearer ' + gd.accessToken,
-                    'Content-Type': 'multipart/related; boundary=' + boundary
-                },
+        // Upsert document: PATCH (create-or-replace). Fallback to POST create if needed.
+        async function firestoreSetDocument(collection, docId, dataObj, conf) {
+            const cfg = conf || state.settings.firebase?.config;
+            if (!cfg?.projectId || !cfg?.apiKey) throw new Error('Firebase is not connected — paste config in Settings');
+            const body = JSON.stringify({ fields: firestoreFieldsFromObject(dataObj) });
+            const headers = { 'Content-Type': 'application/json' };
+
+            let res = await fetch(firestoreDocUrl(cfg, collection, docId), {
+                method: 'PATCH',
+                headers,
                 body
             });
+            if (res.ok) return res.json();
+
+            if (res.status === 404 || res.status === 400) {
+                const errText1 = await res.text().catch(() => '');
+                const res2 = await fetch(firestoreCreateUrl(cfg, collection, docId), {
+                    method: 'POST',
+                    headers,
+                    body
+                });
+                if (res2.ok) return res2.json();
+                if (res2.status === 409) {
+                    const res3 = await fetch(firestoreDocUrl(cfg, collection, docId), {
+                        method: 'PATCH',
+                        headers,
+                        body
+                    });
+                    if (res3.ok) return res3.json();
+                    const err3 = await res3.text().catch(() => '');
+                    throw new Error(describeFirestoreError(res3.status, err3));
+                }
+                const err2 = await res2.text().catch(() => '');
+                throw new Error(describeFirestoreError(res2.status, err2 || errText1));
+            }
+            const errText = await res.text().catch(() => '');
+            throw new Error(describeFirestoreError(res.status, errText));
+        }
+
+        async function firestoreGetDocument(collection, docId, conf) {
+            const cfg = conf || state.settings.firebase?.config;
+            if (!cfg?.projectId || !cfg?.apiKey) throw new Error('Firebase is not connected');
+            const res = await fetch(firestoreDocUrl(cfg, collection, docId), { method: 'GET' });
+            if (res.status === 404) return null;
             if (!res.ok) {
-                const err = await res.text();
-                throw new Error(err || 'Upload failed');
+                const errText = await res.text().catch(() => '');
+                throw new Error(describeFirestoreError(res.status, errText));
             }
             const data = await res.json();
-            w.driveFileId = data.id;
-            // Make public readable
-            try {
-                await fetch(`https://www.googleapis.com/drive/v3/files/${data.id}/permissions`, {
-                    method: 'POST',
-                    headers: {
-                        'Authorization': 'Bearer ' + gd.accessToken,
-                        'Content-Type': 'application/json'
-                    },
-                    body: JSON.stringify({ role: 'reader', type: 'anyone' })
-                });
-            } catch (e) { console.warn('Permission set failed', e); }
-            w.driveUrl = data.webViewLink || `https://drive.google.com/file/d/${data.id}/view`;
-            return w;
+            return objectFromFirestoreFields(data.fields);
         }
 
-        function connectGoogleDrive() {
-            const gd = state.settings.googleDrive;
-            if (!gd.clientId) {
-                showToast('Enter Google OAuth Client ID in Settings first', 'error');
+        function encodeFirebaseRef(cfg) {
+            try {
+                const payload = btoa(unescape(encodeURIComponent(JSON.stringify({ p: cfg.projectId, k: cfg.apiKey }))));
+                return encodeURIComponent(payload);
+            } catch (e) {
+                return encodeURIComponent(btoa(JSON.stringify({ p: cfg.projectId, k: cfg.apiKey })));
+            }
+        }
+        function decodeFirebaseRef(str) {
+            try {
+                const raw = decodeURIComponent(str);
+                const json = decodeURIComponent(escape(atob(raw)));
+                const obj = JSON.parse(json);
+                if (obj && obj.p && obj.k) return { projectId: obj.p, apiKey: obj.k };
+            } catch (e) { /* try simple path */ }
+            try {
+                const obj = JSON.parse(atob(decodeURIComponent(str)));
+                if (obj && obj.p && obj.k) return { projectId: obj.p, apiKey: obj.k };
+            } catch (e2) { /* ignore */ }
+            return null;
+        }
+
+        function parseFirebaseConfigInput(raw) {
+            if (!raw || !raw.trim()) return null;
+            let cleaned = raw.trim();
+            cleaned = cleaned.replace(/\/\*[\s\S]*?\*\//g, '');
+            cleaned = cleaned.replace(/\/\/.*$/gm, '');
+            const match = cleaned.match(/{[\s\S]*}/);
+            const objStr = match ? match[0] : cleaned;
+            try {
+                const obj = Function('"use strict"; return (' + objStr + ');')();
+                if (obj && typeof obj === 'object' && obj.apiKey && obj.projectId) {
+                    return {
+                        apiKey: String(obj.apiKey).trim(),
+                        projectId: String(obj.projectId).trim(),
+                        authDomain: obj.authDomain ? String(obj.authDomain).trim() : '',
+                        storageBucket: obj.storageBucket ? String(obj.storageBucket).trim() : '',
+                        appId: obj.appId ? String(obj.appId).trim() : '',
+                        messagingSenderId: obj.messagingSenderId ? String(obj.messagingSenderId).trim() : ''
+                    };
+                }
+            } catch (e) { /* ignore */ }
+            try {
+                const obj = JSON.parse(objStr);
+                if (obj && obj.apiKey && obj.projectId) {
+                    return {
+                        apiKey: String(obj.apiKey).trim(),
+                        projectId: String(obj.projectId).trim(),
+                        authDomain: obj.authDomain ? String(obj.authDomain).trim() : '',
+                        storageBucket: obj.storageBucket ? String(obj.storageBucket).trim() : '',
+                        appId: obj.appId ? String(obj.appId).trim() : '',
+                        messagingSenderId: obj.messagingSenderId ? String(obj.messagingSenderId).trim() : ''
+                    };
+                }
+            } catch (e2) { /* ignore */ }
+            return null;
+        }
+
+        async function saveFirebaseSettings(e) {
+            e.preventDefault();
+            const form = e.target;
+            const raw = form.firebaseConfigInput.value;
+            const cfg = parseFirebaseConfigInput(raw);
+            if (!cfg) {
+                showToast('Config read aagala — Firebase Console la irunthu full firebaseConfig snippet paste pannunga', 'error');
                 return;
             }
-            // Implicit flow (client-side)
-            const redirect = encodeURIComponent(window.location.href.split('#')[0].split('?')[0]);
-            const scope = encodeURIComponent('https://www.googleapis.com/auth/drive.file');
-            const url = `https://accounts.google.com/o/oauth2/v2/auth?client_id=${encodeURIComponent(gd.clientId)}&redirect_uri=${redirect}&response_type=token&scope=${scope}&include_granted_scopes=true&prompt=consent`;
-            window.location.href = url;
+            if (!cfg.apiKey || !cfg.projectId) {
+                showToast('apiKey and projectId required', 'error');
+                return;
+            }
+            const btn = form.querySelector('button[type="submit"]');
+            const oldHtml = btn ? btn.innerHTML : '';
+            if (btn) { btn.disabled = true; btn.innerHTML = '<i class="fas fa-spinner fa-spin mr-2"></i>Connecting...'; }
+            try {
+                await firestoreSetDocument('_meta', 'connection-test', {
+                    app: 'zero-device-pos',
+                    testedAt: new Date().toISOString(),
+                    ok: true
+                }, cfg);
+                state.settings.firebase = {
+                    config: cfg,
+                    connected: true,
+                    lastConnectedAt: new Date().toISOString()
+                };
+                saveData();
+                showToast('Firebase connected successfully!', 'success');
+                setTimeout(() => resyncPendingWarranties(), 400);
+            } catch (err) {
+                console.warn('Firebase connect failed', err);
+                state.settings.firebase = {
+                    config: cfg,
+                    connected: false,
+                    lastConnectedAt: state.settings.firebase?.lastConnectedAt || null
+                };
+                saveData();
+                showToast(err.message || 'Firebase connect fail aachu', 'error');
+            }
+            if (btn) { btn.disabled = false; btn.innerHTML = oldHtml; }
+            renderSettings();
         }
 
-        function handleGoogleOAuthCallback() {
+        function disconnectFirebase() {
+            if (!confirm('Disconnect Firebase? Warranty QR online check work aagathu until reconnect.')) return;
+            state.settings.firebase = {
+                config: state.settings.firebase?.config || null,
+                connected: false,
+                lastConnectedAt: state.settings.firebase?.lastConnectedAt || null
+            };
+            saveData();
+            showToast('Firebase disconnected', 'info');
+            renderSettings();
+        }
+
+        async function resyncPendingWarranties() {
+            if (!state.settings.firebase?.connected) return;
+            const pending = (state.bills || []).filter(b => b.billWarrantyCode && !b.firebaseSynced);
+            for (const bill of pending.slice(-20)) {
+                try { await syncBillWarrantyToFirebase(bill); } catch (_) {}
+            }
+        }
+
+        async function syncBillWarrantyToFirebase(bill) {
+            if (!state.settings.firebase?.connected || !bill?.billWarrantyCode) return false;
+            const items = state.warranties
+                .filter(w => w.billWarrantyCode === bill.billWarrantyCode)
+                .map(w => ({
+                    code: w.code,
+                    productName: w.productName,
+                    brand: w.brand || '',
+                    chip: w.chip || '',
+                    ram: w.ram || '',
+                    storage: w.storage || '',
+                    size: w.size || '',
+                    specs: w.specs || '',
+                    startDate: w.startDate,
+                    endDate: w.endDate,
+                    months: w.months,
+                    status: w.status,
+                    cancelledAt: w.cancelledAt || '',
+                    cancelReason: w.cancelReason || ''
+                }));
+            const doc = {
+                billWarrantyCode: bill.billWarrantyCode,
+                invoiceNo: bill.invoiceNo,
+                billId: bill.id,
+                customerName: bill.customerName,
+                customerNic: bill.customerNic,
+                customerMobile: bill.customerMobile,
+                businessName: state.settings.businessName,
+                businessPhone: state.settings.businessPhone,
+                businessEmail: state.settings.businessEmail,
+                businessAddress: state.settings.businessAddress || '',
+                createdAt: bill.createdAt,
+                updatedAt: new Date().toISOString(),
+                items
+            };
+            try {
+                await firestoreSetDocument('warranties', bill.billWarrantyCode, doc);
+                bill.firebaseSynced = true;
+                saveData();
+                return true;
+            } catch (err) {
+                console.warn('Firebase warranty sync failed', err);
+                bill.firebaseSynced = false;
+                saveData();
+                showToast('Warranty local-la save aachu (Firebase sync fail — connection check pannunga)', 'warning');
+                return false;
+            }
+        }
+
+        // ==================== PUBLIC WARRANTY QR VIEW ====================
+        function tryRenderPublicWarrantyLink() {
             const hash = window.location.hash || '';
-            if (hash.includes('access_token=')) {
-                const params = new URLSearchParams(hash.replace(/^#/, ''));
-                const token = params.get('access_token');
-                if (token) {
-                    state.settings.googleDrive.accessToken = token;
-                    state.settings.googleDrive.connected = true;
-                    saveData();
-                    // Clean hash
-                    history.replaceState(null, '', window.location.pathname + window.location.search);
-                    showToast('Google Drive connected', 'success');
-                    ensureDriveFolder().catch(() => {});
-                }
+            if (!hash.startsWith('#warranty/')) return false;
+            const code = decodeURIComponent(hash.replace('#warranty/', '').split('&')[0].split('?')[0]).trim();
+            if (!code) return false;
+            const params = new URLSearchParams(window.location.search);
+            const fbParam = params.get('fb');
+            let fbRef = fbParam ? decodeFirebaseRef(fbParam) : null;
+            if (!fbRef && state.settings.firebase?.config?.projectId && state.settings.firebase?.config?.apiKey) {
+                fbRef = {
+                    projectId: state.settings.firebase.config.projectId,
+                    apiKey: state.settings.firebase.config.apiKey
+                };
             }
-            // Also support #warranty/CODE deep link
-            if (hash.startsWith('#warranty/')) {
-                const code = hash.replace('#warranty/', '').split('&')[0];
-                setTimeout(() => {
-                    if (state.currentUser) viewWarrantyPage(code);
-                }, 1500);
-            }
+            document.body.innerHTML = '<div style="font-family:system-ui;display:flex;align-items:center;justify-content:center;min-height:100vh;background:#f1f5f9;color:#64748b;"><div style="text-align:center"><div style="margin:0 auto 12px;border:3px solid #e2e8f0;border-top-color:#0c8ce9;border-radius:50%;width:40px;height:40px;animation:spin .8s linear infinite"></div><p>Loading warranty...</p></div></div><style>@keyframes spin{to{transform:rotate(360deg)}}</style>';
+            renderPublicWarrantyPage(code, fbRef);
+            return true;
         }
 
-        async function ensureDriveFolder() {
-            const gd = state.settings.googleDrive;
-            if (!gd.accessToken || gd.folderId) return;
-            // Search existing folder
-            const q = encodeURIComponent(`name='${gd.folderName || 'ZeroDevice-Warranties'}' and mimeType='application/vnd.google-apps.folder' and trashed=false`);
-            const search = await fetch(`https://www.googleapis.com/drive/v3/files?q=${q}&fields=files(id,name)`, {
-                headers: { Authorization: 'Bearer ' + gd.accessToken }
-            });
-            if (search.ok) {
-                const data = await search.json();
-                if (data.files && data.files[0]) {
-                    gd.folderId = data.files[0].id;
-                    saveData();
+        async function renderPublicWarrantyPage(code, fbRef) {
+            if (!fbRef || !fbRef.projectId || !fbRef.apiKey) {
+                document.open();
+                document.write(buildWarrantyMessageHtml(
+                    'Warranty link incomplete',
+                    'This QR is missing Firebase connection details. Shop must connect Firebase in Settings and print a new invoice.'
+                ));
+                document.close();
+                return;
+            }
+            try {
+                const data = await firestoreGetDocument('warranties', code, fbRef);
+                if (!data) {
+                    document.open();
+                    document.write(buildWarrantyMessageHtml(
+                        'Warranty not found',
+                        'No warranty report found for this code. It may not have been synced yet, or the code is invalid.'
+                    ));
+                    document.close();
                     return;
                 }
-            }
-            // Create folder
-            const create = await fetch('https://www.googleapis.com/drive/v3/files', {
-                method: 'POST',
-                headers: {
-                    Authorization: 'Bearer ' + gd.accessToken,
-                    'Content-Type': 'application/json'
-                },
-                body: JSON.stringify({
-                    name: gd.folderName || 'ZeroDevice-Warranties',
-                    mimeType: 'application/vnd.google-apps.folder'
-                })
-            });
-            if (create.ok) {
-                const folder = await create.json();
-                gd.folderId = folder.id;
-                saveData();
+                document.open();
+                document.write(buildWarrantyReportHtml(data));
+                document.close();
+            } catch (err) {
+                document.open();
+                document.write(buildWarrantyMessageHtml(
+                    'Unable to load warranty',
+                    'Check internet connection and try again. ' + (err.message || '')
+                ));
+                document.close();
             }
         }
 
-        function disconnectGoogleDrive() {
-            state.settings.googleDrive.connected = false;
-            state.settings.googleDrive.accessToken = '';
-            state.settings.googleDrive.folderId = '';
-            saveData();
-            showToast('Google Drive disconnected', 'info');
-            renderSettings();
+        function buildWarrantyMessageHtml(title, message) {
+            const safeTitle = String(title).replace(/</g, '&lt;');
+            const safeMsg = String(message).replace(/</g, '&lt;');
+            return `<!DOCTYPE html>
+<html lang="en"><head>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>${safeTitle}</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:system-ui,-apple-system,sans-serif;background:#f1f5f9;color:#1e293b;min-height:100vh;display:flex;align-items:center;justify-content:center;padding:24px}
+.card{max-width:420px;background:#fff;border-radius:16px;padding:32px 24px;text-align:center;box-shadow:0 20px 50px -20px rgba(11,63,110,.35);border:1px solid #e2e8f0}
+h1{font-size:1.1rem;margin-bottom:10px;color:#0b3f6e}
+p{font-size:.875rem;color:#64748b;line-height:1.5}
+button{margin-top:18px;background:#0c8ce9;color:#fff;border:none;border-radius:8px;padding:10px 18px;font-size:.85rem;font-weight:600;cursor:pointer}
+</style></head><body>
+<div class="card"><h1>${safeTitle}</h1><p>${safeMsg}</p><button onclick="location.reload()">Try Again</button></div>
+</body></html>`;
+        }
+
+        function buildWarrantyReportHtml(data) {
+            const s = {
+                businessName: data.businessName || 'Zero Device',
+                businessPhone: data.businessPhone || '',
+                businessEmail: data.businessEmail || '',
+                businessAddress: data.businessAddress || ''
+            };
+            const items = data.items || [];
+            const anyCancelled = items.some(w => w.status === 'Cancelled');
+            const itemBlocks = items.map(w => {
+                const isCancelled = w.status === 'Cancelled';
+                const isExpired = !isCancelled && w.endDate && new Date(w.endDate) < new Date();
+                const statusLabel = isCancelled ? 'CANCELLED' : isExpired ? 'EXPIRED' : 'ACTIVE';
+                const statusColor = isCancelled ? '#dc2626' : isExpired ? '#64748b' : '#059669';
+                const details = [w.brand, w.chip, w.ram, w.storage, w.size, w.specs].filter(Boolean).join(' · ');
+                const cancelBanner = isCancelled
+                    ? `<div class="banner">⚠ This warranty has been CANCELLED${w.cancelReason ? ': ' + String(w.cancelReason).replace(/</g,'&lt;') : ''}</div>`
+                    : '';
+                return `
+  ${cancelBanner}
+  <div class="body">
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px;gap:12px;flex-wrap:wrap">
+      <div>
+        <p style="font-size:.7rem;color:#64748b;text-transform:uppercase;letter-spacing:.08em">Warranty Code</p>
+        <p class="code">${String(w.code || '').replace(/</g,'&lt;')}</p>
+      </div>
+      <span class="badge" style="background:${statusColor}">${statusLabel}</span>
+    </div>
+    <div class="row"><span>Product</span><span>${String(w.productName || '').replace(/</g,'&lt;')}</span></div>
+    ${details ? `<div class="row"><span>Specs</span><span>${details.replace(/</g,'&lt;')}</span></div>` : ''}
+    <div class="row"><span>Valid From</span><span>${w.startDate ? new Date(w.startDate).toLocaleDateString('en-GB') : '—'}</span></div>
+    <div class="row"><span>Valid Until</span><span>${w.endDate ? new Date(w.endDate).toLocaleDateString('en-GB') : '—'}</span></div>
+    <div class="row"><span>Duration</span><span>${w.months || '—'} months</span></div>
+    ${isCancelled && w.cancelledAt ? `<div class="row"><span>Cancelled On</span><span>${new Date(w.cancelledAt).toLocaleDateString('en-GB')}</span></div>` : ''}
+  </div>`;
+            }).join('<div style="height:1px;background:#e2e8f0;margin:4px 24px"></div>');
+
+            const topBanner = anyCancelled
+                ? `<div class="banner" style="font-size:.9rem">One or more warranties on this bill are CANCELLED</div>`
+                : '';
+
+            return `<!DOCTYPE html>
+<html lang="en"><head>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Warranty ${String(data.billWarrantyCode || '').replace(/</g,'&lt;')} — ${String(s.businessName).replace(/</g,'&lt;')}</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:system-ui,-apple-system,sans-serif;background:#f1f5f9;color:#1e293b;min-height:100vh;padding:24px}
+.card{max-width:520px;margin:0 auto;background:#fff;border-radius:16px;overflow:hidden;box-shadow:0 20px 50px -20px rgba(11,63,110,.35);border:1px solid #e2e8f0}
+.header{background:linear-gradient(135deg,#0c8ce9,#0158a1,#072849);color:#fff;padding:20px 24px}
+.header h1{font-size:1.25rem;font-weight:700}
+.header p{opacity:.85;font-size:.8rem;margin-top:4px}
+.body{padding:20px 24px}
+.badge{display:inline-block;padding:6px 14px;border-radius:999px;color:#fff;font-weight:700;font-size:.75rem;letter-spacing:.05em}
+.row{display:flex;justify-content:space-between;gap:12px;padding:8px 0;border-bottom:1px solid #f1f5f9;font-size:.875rem}
+.row span:first-child{color:#64748b;flex-shrink:0}
+.row span:last-child{font-weight:600;text-align:right}
+.footer{padding:16px 24px;background:#f8fafc;text-align:center;font-size:.7rem;color:#94a3b8;border-top:1px solid #e2e8f0}
+.code{font-family:ui-monospace,monospace;font-size:1rem;font-weight:700;color:#0c8ce9;letter-spacing:.02em;word-break:break-all}
+.banner{background:#fef2f2;color:#b91c1c;padding:10px 16px;text-align:center;font-weight:600;font-size:.85rem}
+@media print{body{background:#fff;padding:0}.card{box-shadow:none;border:none}}
+</style></head><body>
+<div class="card">
+  <div class="header">
+    <h1>${String(s.businessName).replace(/</g,'&lt;')}</h1>
+    <p>Official Product Warranty Certificate</p>
+  </div>
+  ${topBanner}
+  <div class="body" style="padding-bottom:0">
+    <div class="row"><span>Customer</span><span>${String(data.customerName || '').replace(/</g,'&lt;')}</span></div>
+    <div class="row"><span>NIC</span><span>${String(data.customerNic || '').replace(/</g,'&lt;')}</span></div>
+    <div class="row"><span>Mobile</span><span>${String(data.customerMobile || '').replace(/</g,'&lt;')}</span></div>
+    <div class="row"><span>Invoice</span><span>${String(data.invoiceNo || '').replace(/</g,'&lt;')}</span></div>
+  </div>
+  ${itemBlocks || '<div class="body"><p style="color:#64748b;font-size:.9rem">No warranty items</p></div>'}
+  <div class="footer">
+    ${String(s.businessName).replace(/</g,'&lt;')} · ${String(s.businessPhone).replace(/</g,'&lt;')} · ${String(s.businessEmail).replace(/</g,'&lt;')}<br>
+    ${s.businessAddress ? String(s.businessAddress).replace(/</g,'&lt;') + '<br>' : ''}
+    Computer-generated warranty report · Ref: ${String(data.billWarrantyCode || '').replace(/</g,'&lt;')}<br>
+    <button onclick="window.print()" style="margin-top:10px;background:#0c8ce9;color:#fff;border:none;border-radius:8px;padding:8px 14px;font-size:.8rem;font-weight:600;cursor:pointer">Print / Save as PDF</button>
+  </div>
+</div>
+</body></html>`;
         }
 
         // ==================== SETTINGS ====================
         function renderSettings() {
             const content = document.getElementById('page-content');
             const s = state.settings;
-            const gd = s.googleDrive || {};
+            const fb = s.firebase || { config: null, connected: false };
             
             content.innerHTML = `
                 <div class="space-y-4 max-w-3xl">
@@ -3022,7 +3330,7 @@ ${isCancelled ? '.card{opacity:.92} .banner{background:#fef2f2;color:#b91c1c;pad
                             <span class="icon-wrap"><i class="fas fa-shield-halved"></i></span>
                             <span>
                                 <span class="block text-sm">Warranty Settings</span>
-                                <span class="block text-xs font-normal text-slate-400">Default period & public page base URL</span>
+                                <span class="block text-xs font-normal text-slate-400">Default warranty period</span>
                             </span>
                             <i class="fas fa-chevron-down chevron"></i>
                         </button>
@@ -3032,11 +3340,6 @@ ${isCancelled ? '.card{opacity:.92} .banner{background:#fef2f2;color:#b91c1c;pad
                                     <label class="block text-xs font-medium text-slate-500 mb-1">Default Warranty Period (months)</label>
                                     <input type="number" name="warrantyMonths" value="${s.warrantyMonths || 12}" min="1" max="60" class="w-full px-3 py-2 rounded-lg border border-slate-200 text-sm">
                                 </div>
-                                <div>
-                                    <label class="block text-xs font-medium text-slate-500 mb-1">Warranty Page Base URL (optional)</label>
-                                    <input type="text" name="warrantyBaseUrl" value="${s.warrantyBaseUrl || ''}" placeholder="https://yoursite.com/pos.html" class="w-full px-3 py-2 rounded-lg border border-slate-200 text-sm">
-                                    <p class="text-[10px] text-slate-400 mt-1">Used in QR when Drive is not connected. Leave empty to use current page URL + #warranty/CODE</p>
-                                </div>
                                 <button type="submit" class="animated-btn btn-primary text-white text-sm font-medium px-5 py-2.5 rounded-lg">
                                     <i class="fas fa-save mr-2"></i>Save Warranty Settings
                                 </button>
@@ -3044,57 +3347,66 @@ ${isCancelled ? '.card{opacity:.92} .banner{background:#fef2f2;color:#b91c1c;pad
                         </div>
                     </div>
 
-                    <!-- 4. Google Drive -->
-                    <div class="settings-section" id="sec-drive">
-                        <button type="button" class="settings-section-btn" onclick="toggleSettingsSection('sec-drive')">
-                            <span class="icon-wrap"><i class="fab fa-google-drive"></i></span>
+                    <!-- 4. Firebase Connection -->
+                    <div class="settings-section" id="sec-firebase">
+                        <button type="button" class="settings-section-btn" onclick="toggleSettingsSection('sec-firebase')">
+                            <span class="icon-wrap"><i class="fas fa-fire"></i></span>
                             <span>
-                                <span class="block text-sm">Google Drive (Warranty Pages)</span>
-                                <span class="block text-xs font-normal text-slate-400">OAuth · API · Save unique warranty HTML pages</span>
+                                <span class="block text-sm">Firebase Connection</span>
+                                <span class="block text-xs font-normal text-slate-400">Powers online warranty storage & QR lookup</span>
                             </span>
                             <i class="fas fa-chevron-down chevron"></i>
                         </button>
                         <div class="settings-body">
-                            <form class="space-y-3 pt-2" onsubmit="saveGoogleDriveSettings(event)">
+                            <form class="space-y-3 pt-2" onsubmit="saveFirebaseSettings(event)">
                                 <div class="p-3 rounded-lg bg-blue-50 border border-blue-100 text-xs text-blue-800 leading-relaxed">
-                                    <p class="font-semibold mb-1"><i class="fas fa-info-circle mr-1"></i> Setup</p>
+                                    <p class="font-semibold mb-1"><i class="fas fa-info-circle mr-1"></i> Firebase setup (warranty only)</p>
                                     <ol class="list-decimal ml-4 space-y-1">
-                                        <li>Create a project in Google Cloud Console</li>
-                                        <li>Enable <strong>Google Drive API</strong></li>
-                                        <li>Create OAuth 2.0 Client ID (Web application)</li>
-                                        <li>Add this page URL as Authorized redirect URI</li>
-                                        <li>Paste Client ID below and click Connect</li>
+                                        <li>Go to <strong>console.firebase.google.com</strong> → create project → add a <strong>Web app</strong></li>
+                                        <li>Enable <strong>Firestore Database</strong> (Build → Firestore → Create database). Start in <strong>test mode</strong>, then paste the rules below.</li>
+                                        <li>Project settings → Your apps → copy the full <code>firebaseConfig</code> object and paste below → Connect</li>
+                                        <li>Host this POS page on <strong>http/https</strong> (not file://) so customer phone can open the QR link</li>
                                     </ol>
-                                    <p class="mt-2">Each warranty gets a unique HTML page uploaded to Drive. QR on invoice opens that page.</p>
+                                    <p class="mt-2">Only warranty reports go online. Products, sales, customers stay in this browser (local).</p>
                                 </div>
                                 <div>
-                                    <label class="block text-xs font-medium text-slate-500 mb-1">OAuth Client ID</label>
-                                    <input type="text" name="clientId" value="${gd.clientId || ''}" placeholder="xxxxx.apps.googleusercontent.com" class="w-full px-3 py-2 rounded-lg border border-slate-200 text-sm font-mono text-xs">
-                                </div>
-                                <div>
-                                    <label class="block text-xs font-medium text-slate-500 mb-1">API Key (optional)</label>
-                                    <input type="text" name="apiKey" value="${gd.apiKey || ''}" placeholder="AIza..." class="w-full px-3 py-2 rounded-lg border border-slate-200 text-sm font-mono text-xs">
-                                </div>
-                                <div>
-                                    <label class="block text-xs font-medium text-slate-500 mb-1">Drive Folder Name</label>
-                                    <input type="text" name="folderName" value="${gd.folderName || 'ZeroDevice-Warranties'}" class="w-full px-3 py-2 rounded-lg border border-slate-200 text-sm">
+                                    <label class="block text-xs font-medium text-slate-500 mb-1">Firebase Config</label>
+                                    <textarea name="firebaseConfigInput" rows="5" placeholder='const firebaseConfig = {
+  apiKey: "...",
+  authDomain: "...",
+  projectId: "...",
+  ...
+};' class="w-full px-3 py-2 rounded-lg border border-slate-200 text-xs font-mono">${fb.config ? JSON.stringify(fb.config, null, 2) : ''}</textarea>
+                                    <p class="text-[10px] text-slate-400 mt-1">Paste the exact snippet from Firebase Console — it's parsed automatically, no need to edit it.</p>
                                 </div>
                                 <div class="flex items-center gap-2 text-sm">
-                                    <span class="w-2.5 h-2.5 rounded-full ${gd.connected ? 'bg-emerald-500' : 'bg-slate-300'}"></span>
-                                    <span class="${gd.connected ? 'text-emerald-700 font-medium' : 'text-slate-500'}">${gd.connected ? 'Connected to Google Drive' : 'Not connected'}</span>
+                                    <span class="w-2.5 h-2.5 rounded-full ${fb.connected ? 'bg-emerald-500' : 'bg-slate-300'}"></span>
+                                    <span class="${fb.connected ? 'text-emerald-700 font-medium' : 'text-slate-500'}">${fb.connected ? 'Connected to Firebase' : 'Not connected'}</span>
                                 </div>
                                 <div class="flex flex-wrap gap-2">
                                     <button type="submit" class="animated-btn btn-primary text-white text-sm font-medium px-4 py-2.5 rounded-lg">
-                                        <i class="fas fa-save mr-2"></i>Save Drive Settings
+                                        <i class="fas fa-plug mr-2"></i>${fb.connected ? 'Reconnect' : 'Connect'}
                                     </button>
-                                    ${gd.connected ? `
-                                    <button type="button" onclick="disconnectGoogleDrive()" class="animated-btn px-4 py-2.5 rounded-lg border border-red-200 text-red-600 text-sm font-medium hover:bg-red-50">
+                                    ${fb.connected ? `
+                                    <button type="button" onclick="disconnectFirebase()" class="animated-btn px-4 py-2.5 rounded-lg border border-red-200 text-red-600 text-sm font-medium hover:bg-red-50">
                                         <i class="fas fa-unlink mr-2"></i>Disconnect
-                                    </button>` : `
-                                    <button type="button" onclick="connectGoogleDrive()" class="animated-btn px-4 py-2.5 rounded-lg bg-emerald-600 text-white text-sm font-medium hover:bg-emerald-700">
-                                        <i class="fab fa-google-drive mr-2"></i>Connect Google Drive
-                                    </button>`}
+                                    </button>` : ''}
                                 </div>
+                                <details class="text-xs text-slate-500">
+                                    <summary class="cursor-pointer font-medium text-slate-600">Firestore security rules (paste in Firebase Console → Firestore → Rules)</summary>
+                                    <pre class="mt-2 p-2.5 rounded-lg bg-slate-800 text-slate-100 overflow-x-auto text-[10px] leading-relaxed">rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    match /warranties/{code} {
+      allow read, write: if true;
+    }
+    match /_meta/{doc} {
+      allow read, write: if true;
+    }
+  }
+}</pre>
+                                    <p class="mt-1">This lets the POS write warranty reports and lets a customer's phone read them by code, with no backend server. Since anyone with the code can read/write, only warranty data — never products, pricing, or customer login info — is ever sent here.</p>
+                                </details>
                             </form>
                         </div>
                     </div>
@@ -3146,7 +3458,7 @@ ${isCancelled ? '.card{opacity:.92} .banner{background:#fef2f2;color:#b91c1c;pad
                         </button>
                         <div class="settings-body">
                             <p class="text-sm text-slate-500 mb-3 pt-2">
-                                Data is stored in this browser. Export backups regularly. Warranty HTML pages can also be saved to Google Drive.
+                                Data is stored in this browser. Export backups regularly. Warranty reports are additionally stored securely in Firebase when connected.
                             </p>
                             <div class="flex flex-wrap gap-3">
                                 <button onclick="exportData()" class="animated-btn px-4 py-2.5 rounded-lg border border-slate-200 text-sm font-medium text-slate-700 hover:bg-slate-50 flex items-center gap-2">
@@ -3184,7 +3496,7 @@ ${isCancelled ? '.card{opacity:.92} .banner{background:#fef2f2;color:#b91c1c;pad
                                 <div>
                                     <h3 class="font-semibold text-slate-800 mb-1">Zero Device POS</h3>
                                     <p class="text-sm text-slate-600 leading-relaxed mb-2">${s.businessDescription || ''}</p>
-                                    <p class="text-xs text-slate-400">POS System v${APP_VERSION} · Local storage + optional Google Drive warranties</p>
+                                    <p class="text-xs text-slate-400">POS System v${APP_VERSION} · Local storage + Firebase-powered warranty verification</p>
                                 </div>
                             </div>
                         </div>
@@ -3231,25 +3543,8 @@ ${isCancelled ? '.card{opacity:.92} .banner{background:#fef2f2;color:#b91c1c;pad
             e.preventDefault();
             const form = e.target;
             state.settings.warrantyMonths = parseInt(form.warrantyMonths.value) || 12;
-            state.settings.warrantyBaseUrl = (form.warrantyBaseUrl.value || '').trim();
             saveData();
             showToast('Warranty settings saved', 'success');
-            renderSettings();
-        }
-
-        function saveGoogleDriveSettings(e) {
-            e.preventDefault();
-            const form = e.target;
-            if (!state.settings.googleDrive) {
-                state.settings.googleDrive = {
-                    clientId: '', apiKey: '', connected: false, accessToken: '', folderId: '', folderName: 'ZeroDevice-Warranties'
-                };
-            }
-            state.settings.googleDrive.clientId = (form.clientId.value || '').trim();
-            state.settings.googleDrive.apiKey = (form.apiKey.value || '').trim();
-            state.settings.googleDrive.folderName = (form.folderName.value || 'ZeroDevice-Warranties').trim();
-            saveData();
-            showToast('Google Drive settings saved', 'success');
             renderSettings();
         }
 
