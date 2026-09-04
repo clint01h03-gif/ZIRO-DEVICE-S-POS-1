@@ -610,6 +610,17 @@
         // ==================== DATA & STATE ====================
         const APP_VERSION = '1.4.0';
 
+        // Permanent Firebase project (embedded) — auto-connects on every device
+        const BUILTIN_FIREBASE_CONFIG = {
+            apiKey: "AIzaSyA360bVN0-Px5AbsJd08k_8U9_SShPxJBY",
+            authDomain: "ziro-devise-s.firebaseapp.com",
+            projectId: "ziro-devise-s",
+            storageBucket: "ziro-devise-s.firebasestorage.app",
+            messagingSenderId: "687847004638",
+            appId: "1:687847004638:web:1d660ff8d261886034a54f",
+            measurementId: "G-SFN9F0161X"
+        };
+
         const STORAGE_KEY = 'zero_device_pos_data';
         
         let state = {
@@ -661,21 +672,31 @@
         function initApp() {
             loadData();
 
+            // Always use embedded Firebase project
+            if (!state.settings.firebase) state.settings.firebase = { config: null, connected: false, lastConnectedAt: null };
+            state.settings.firebase.config = { ...BUILTIN_FIREBASE_CONFIG };
+            state.settings.firebase.connected = true;
+            if (!state.settings.firebase.lastConnectedAt) {
+                state.settings.firebase.lastConnectedAt = new Date().toISOString();
+            }
+            try { localStorage.setItem(STORAGE_KEY, JSON.stringify(getPosSnapshot())); } catch (_) {}
+
             // Public warranty QR deep link — works without login, using Firebase only.
             // Short-circuits the whole POS app and renders just the warranty report.
             if (tryRenderPublicWarrantyLink()) return;
 
-            // If Firebase already connected, merge cloud data then auto-refresh between devices
-            if (state.settings.firebase?.connected && state.settings.firebase?.config) {
-                loadAllDataFromFirebase('merge').then(ok => {
-                    if (ok) {
-                        const active = document.querySelector('.sidebar-item.active');
-                        if (active && !document.getElementById('main-app').classList.contains('hidden')) {
-                            navigateTo(active.dataset.page || 'dashboard');
-                        }
+            // Auto pull/merge cloud data, then keep devices in sync
+            loadAllDataFromFirebase('merge').then(ok => {
+                if (ok) {
+                    const active = document.querySelector('.sidebar-item.active');
+                    if (active && !document.getElementById('main-app').classList.contains('hidden')) {
+                        navigateTo(active.dataset.page || 'dashboard');
                     }
-                }).catch(() => {});
-            }
+                } else {
+                    // First time: push local up
+                    pushAllCollectionsToFirebase().catch(() => {});
+                }
+            }).catch(() => {});
             startCloudAutoRefresh();
             
             // Ensure default admin exists
@@ -3839,7 +3860,7 @@ body{font-family:system-ui,-apple-system,sans-serif;background:#f1f5f9;color:#1e
                                         <li>Project settings → Your apps → copy the full <code>firebaseConfig</code> object and paste below → Connect</li>
                                         <li>Host this POS page on <strong>http/https</strong> (not file://) so customer phone can open the QR link</li>
                                     </ol>
-                                    <p class="mt-2">When connected, <strong>all POS data</strong> (products, customers, bills, warranties, users, settings) syncs to Firebase. Warranty QR still works online for customers.</p>
+                                    <p class="mt-2"><strong>Firebase is permanently linked</strong> to project <code>ziro-devise-s</code>. All POS data auto-syncs. Warranty QR works online for customers.</p>
                                 </div>
                                 <div>
                                     <label class="block text-xs font-medium text-slate-500 mb-1">Firebase Config</label>
