@@ -665,9 +665,9 @@
             // Short-circuits the whole POS app and renders just the warranty report.
             if (tryRenderPublicWarrantyLink()) return;
 
-            // If Firebase already connected, refresh from cloud in background
+            // If Firebase already connected, merge cloud data then auto-refresh between devices
             if (state.settings.firebase?.connected && state.settings.firebase?.config) {
-                loadAllDataFromFirebase().then(ok => {
+                loadAllDataFromFirebase('merge').then(ok => {
                     if (ok) {
                         const active = document.querySelector('.sidebar-item.active');
                         if (active && !document.getElementById('main-app').classList.contains('hidden')) {
@@ -676,6 +676,7 @@
                     }
                 }).catch(() => {});
             }
+            startCloudAutoRefresh();
             
             // Ensure default admin exists
             if (state.users.length === 0) {
@@ -816,6 +817,10 @@
             };
         }
 
+        let _cloudSyncLock = false;
+        let _cloudSyncTimer = null;
+        let _lastCloudPullAt = 0;
+
         function saveData(opts) {
             opts = opts || {};
             try {
@@ -825,31 +830,102 @@
                 console.error('Failed to save data:', e);
                 showToast('Failed to save data', 'error');
             }
-            // Cloud sync (all POS data) when Firebase is connected
+            // Cloud: merge-with-cloud then push (prevents A1/A2 overwrite)
             if (!opts.skipCloud && state.settings.firebase?.connected) {
-                syncAllDataToFirebase().catch(err => console.warn('Cloud sync failed', err));
+                queueCloudSync();
             }
         }
 
-        async function syncAllDataToFirebase() {
+        function queueCloudSync() {
+            if (_cloudSyncTimer) clearTimeout(_cloudSyncTimer);
+            _cloudSyncTimer = setTimeout(() => {
+                mergePullThenPush().catch(err => console.warn('Cloud sync failed', err));
+            }, 400);
+        }
+
+        function itemTime(obj) {
+            if (!obj) return 0;
+            const t = obj.updatedAt || obj.createdAt || obj.syncedAt || '';
+            const n = Date.parse(t);
+            return Number.isFinite(n) ? n : 0;
+        }
+
+        function mergeById(localArr, remoteArr, idKey) {
+            idKey = idKey || 'id';
+            const map = new Map();
+            (remoteArr || []).forEach(item => {
+                if (item && item[idKey] != null) map.set(String(item[idKey]), item);
+            });
+            (localArr || []).forEach(item => {
+                if (!item || item[idKey] == null) return;
+                const k = String(item[idKey]);
+                const existing = map.get(k);
+                if (!existing) {
+                    map.set(k, item);
+                } else {
+                    // Prefer newer record
+                    map.set(k, itemTime(item) >= itemTime(existing) ? item : existing);
+                }
+            });
+            return Array.from(map.values());
+        }
+
+        function mergeWarranties(localArr, remoteArr) {
+            const map = new Map();
+            const add = (item) => {
+                if (!item) return;
+                const k = item.code || String(item.id);
+                if (!k) return;
+                const existing = map.get(k);
+                if (!existing) map.set(k, item);
+                else map.set(k, itemTime(item) >= itemTime(existing) ? item : existing);
+            };
+            (remoteArr || []).forEach(add);
+            (localArr || []).forEach(add);
+            return Array.from(map.values());
+        }
+
+        function applyRemoteSnapshot(data, mode) {
+            // mode: 'replace' | 'merge'
+            if (!data) return false;
+            if (mode === 'replace') {
+                if (data.products) state.products = data.products;
+                if (data.customers) state.customers = data.customers;
+                if (data.bills) state.bills = data.bills;
+                if (data.warranties) state.warranties = data.warranties;
+                if (data.users && data.users.length) state.users = data.users;
+            } else {
+                state.products = mergeById(state.products, data.products || [], 'id');
+                state.customers = mergeById(state.customers, data.customers || [], 'id');
+                state.bills = mergeById(state.bills, data.bills || [], 'id');
+                state.warranties = mergeWarranties(state.warranties, data.warranties || []);
+                state.users = mergeById(state.users, data.users || [], 'id');
+                // Also merge bills by invoiceNo for safety
+                const byInv = new Map();
+                state.bills.forEach(b => { if (b.invoiceNo) byInv.set(b.invoiceNo, b); });
+                state.bills = Array.from(byInv.values()).length ? Array.from(new Map([...state.bills.map(b => [String(b.id), b])]).values()) : state.bills;
+            }
+            if (data.settings) {
+                const fbKeep = state.settings.firebase;
+                const { firebase: _drop, ...rest } = data.settings;
+                state.settings = { ...state.settings, ...rest, firebase: fbKeep };
+            }
+            state.nextProductId = Math.max(state.nextProductId || 1, data.nextProductId || 1);
+            state.nextBillId = Math.max(state.nextBillId || 1, data.nextBillId || 1);
+            state.nextCustomerId = Math.max(state.nextCustomerId || 1, data.nextCustomerId || 1);
+            state.nextWarrantyId = Math.max(state.nextWarrantyId || 1, data.nextWarrantyId || 1);
+            return true;
+        }
+
+        async function pushSnapshotToFirebase() {
             if (!state.settings.firebase?.connected) return false;
             const snap = getPosSnapshot();
-            // Avoid writing huge base64 images that blow Firestore 1MB limit: keep images, but if payload too big strip pageHtml from warranties
             const light = JSON.parse(JSON.stringify(snap));
-            if (light.warranties) {
-                light.warranties.forEach(w => { delete w.pageHtml; });
-            }
-            // Strip firebase nested cycle / keep config
+            if (light.warranties) light.warranties.forEach(w => { delete w.pageHtml; });
             try {
-                const payload = {
-                    ...light,
-                    syncedAt: new Date().toISOString()
-                };
-                // Firestore document size limit ~1MB — store as one snapshot doc
-                await firestoreSetDocument('pos_data', 'main', payload);
+                await firestoreSetDocument('pos_data', 'main', { ...light, syncedAt: new Date().toISOString() });
                 return true;
             } catch (err) {
-                // Retry without product images if too large
                 try {
                     const lighter = JSON.parse(JSON.stringify(light));
                     (lighter.products || []).forEach(p => {
@@ -869,30 +945,83 @@
             }
         }
 
-        async function loadAllDataFromFirebase() {
+        async function syncAllDataToFirebase() {
+            return mergePullThenPush();
+        }
+
+        async function mergePullThenPush() {
+            if (!state.settings.firebase?.connected) return false;
+            if (_cloudSyncLock) return false;
+            _cloudSyncLock = true;
+            try {
+                // 1) Pull cloud first
+                try {
+                    const data = await firestoreGetDocument('pos_data', 'main');
+                    if (data) applyRemoteSnapshot(data, 'merge');
+                } catch (e) {
+                    console.warn('pre-push pull failed', e);
+                }
+                // 2) Save merged local
+                try {
+                    localStorage.setItem(STORAGE_KEY, JSON.stringify(getPosSnapshot()));
+                } catch (_) {}
+                // 3) Push merged
+                const ok = await pushSnapshotToFirebase();
+                _lastCloudPullAt = Date.now();
+                return ok;
+            } finally {
+                _cloudSyncLock = false;
+            }
+        }
+
+        async function loadAllDataFromFirebase(mode) {
+            // mode default merge for multi-device; 'replace' only for explicit Pull button
+            mode = mode || 'merge';
             if (!state.settings.firebase?.config?.projectId) return false;
             try {
                 const data = await firestoreGetDocument('pos_data', 'main');
                 if (!data) return false;
-                if (data.products) state.products = data.products;
-                if (data.customers) state.customers = data.customers;
-                if (data.bills) state.bills = data.bills;
-                if (data.warranties) state.warranties = data.warranties;
-                if (data.users && data.users.length) state.users = data.users;
-                if (data.settings) {
-                    const fbKeep = state.settings.firebase;
-                    state.settings = { ...state.settings, ...data.settings, firebase: fbKeep || data.settings.firebase };
-                }
-                if (data.nextProductId) state.nextProductId = data.nextProductId;
-                if (data.nextBillId) state.nextBillId = data.nextBillId;
-                if (data.nextCustomerId) state.nextCustomerId = data.nextCustomerId;
-                if (data.nextWarrantyId) state.nextWarrantyId = data.nextWarrantyId;
+                applyRemoteSnapshot(data, mode);
                 saveData({ skipCloud: true });
+                _lastCloudPullAt = Date.now();
                 return true;
             } catch (err) {
                 console.warn('Load from Firebase failed', err);
                 return false;
             }
+        }
+
+        async function refreshFromCloudSilent() {
+            if (!state.settings.firebase?.connected) return;
+            if (_cloudSyncLock) return;
+            if (Date.now() - _lastCloudPullAt < 8000) return;
+            try {
+                const data = await firestoreGetDocument('pos_data', 'main');
+                if (!data) return;
+                const billCountBefore = state.bills.length;
+                applyRemoteSnapshot(data, 'merge');
+                saveData({ skipCloud: true });
+                _lastCloudPullAt = Date.now();
+                if (state.bills.length !== billCountBefore) {
+                    const active = document.querySelector('.sidebar-item.active');
+                    if (active && !document.getElementById('main-app').classList.contains('hidden')) {
+                        navigateTo(active.dataset.page || 'dashboard');
+                    }
+                }
+            } catch (e) {
+                console.warn('silent refresh failed', e);
+            }
+        }
+
+        function startCloudAutoRefresh() {
+            if (window._zdCloudInterval) clearInterval(window._zdCloudInterval);
+            window._zdCloudInterval = setInterval(() => {
+                if (state.settings.firebase?.connected) refreshFromCloudSilent();
+            }, 12000);
+            document.addEventListener('visibilitychange', () => {
+                if (document.visibilityState === 'visible') refreshFromCloudSilent();
+            });
+            window.addEventListener('focus', () => refreshFromCloudSilent());
         }
 
         function exportData() {
@@ -1772,7 +1901,7 @@
             }
         }
 
-        function processBill() {
+        async function processBill() {
             const name = document.getElementById('bill-customer-name').value.trim();
             const nic = document.getElementById('bill-customer-nic').value.trim();
             const mobile = document.getElementById('bill-customer-mobile').value.trim();
@@ -1785,6 +1914,13 @@
             if (!billingCart.length) {
                 showToast('Please add at least one product', 'error');
                 return;
+            }
+
+            // Multi-device: pull+merge latest cloud data before creating bill
+            if (state.settings.firebase?.connected) {
+                try {
+                    await loadAllDataFromFirebase('merge');
+                } catch (_) {}
             }
             
             // Validate stock
@@ -3211,7 +3347,7 @@ ${isCancelled ? '.card{opacity:.92} .banner{background:#fef2f2;color:#b91c1c;pad
             }
             if (!confirm('Pull cloud data to this device? Local data will be replaced with cloud copy.')) return;
             showToast('Downloading from Firebase...', 'info');
-            const ok = await loadAllDataFromFirebase();
+            const ok = await loadAllDataFromFirebase('replace');
             if (ok) {
                 showToast('Cloud data loaded', 'success');
                 const active = document.querySelector('.sidebar-item.active');
