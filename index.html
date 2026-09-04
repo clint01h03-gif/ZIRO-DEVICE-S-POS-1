@@ -9,7 +9,7 @@
     <script src="https://cdn.jsdelivr.net/npm/qrcodejs@1.0.0/qrcode.min.js"></script>
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.1/css/all.min.css">
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=Playfair+Display:wght@600;700&display=swap" rel="stylesheet">
-    <script>A
+    <script>
         tailwind.config = {
             theme: {
                 extend: {
@@ -396,6 +396,46 @@
             background: linear-gradient(135deg, #94a3b8, #64748b);
             color: white;
         }
+
+        /* Mobile responsive */
+        #sidebar-overlay {
+            display: none;
+            position: fixed;
+            inset: 0;
+            background: rgba(15, 23, 42, 0.45);
+            z-index: 35;
+            backdrop-filter: blur(2px);
+        }
+        #sidebar-overlay.show { display: block; }
+        @media (max-width: 1023px) {
+            #sidebar {
+                transform: translateX(-100%);
+                transition: transform 0.3s ease;
+                width: min(18rem, 85vw) !important;
+            }
+            #sidebar.open {
+                transform: translateX(0);
+            }
+            #main-content-area {
+                margin-left: 0 !important;
+            }
+            #page-content {
+                padding: 1rem !important;
+            }
+            header.sticky {
+                padding-left: 0.75rem !important;
+                padding-right: 0.75rem !important;
+            }
+            #page-title { font-size: 1.05rem !important; }
+            #page-subtitle { display: none; }
+            .stat-card p.text-2xl { font-size: 1.25rem; }
+        }
+        @media (min-width: 1024px) {
+            #menu-toggle { display: none !important; }
+            #sidebar-overlay { display: none !important; }
+            #sidebar { transform: none !important; }
+        }
+
     </style>
 
 </head>
@@ -461,6 +501,7 @@
 
     <!-- Main App -->
     <div id="main-app" class="hidden min-h-screen flex">
+        <div id="sidebar-overlay" onclick="closeSidebar()"></div>
         <!-- Sidebar -->
         <aside id="sidebar" class="w-64 bg-white border-r border-slate-200 flex flex-col fixed h-full z-40 shadow-soft">
             <div class="p-5 border-b border-slate-100">
@@ -468,10 +509,13 @@
                     <div class="w-10 h-10 rounded-xl bg-gradient-to-br from-primary-500 to-primary-700 flex items-center justify-center shadow-md">
                         <i class="fas fa-laptop text-white text-lg"></i>
                     </div>
-                    <div>
+                    <div class="flex-1 min-w-0">
                         <h1 class="font-display font-bold text-lg text-slate-800 leading-tight">Zero Device</h1>
                         <p class="text-xs text-slate-400">POS System</p>
                     </div>
+                    <button type="button" class="lg:hidden w-9 h-9 rounded-lg hover:bg-slate-100 text-slate-500" onclick="closeSidebar()" aria-label="Close menu">
+                        <i class="fas fa-times"></i>
+                    </button>
                 </div>
             </div>
             
@@ -524,22 +568,27 @@
         </aside>
 
         <!-- Main Content -->
-        <main class="flex-1 ml-64 min-h-screen">
+        <main id="main-content-area" class="flex-1 ml-0 lg:ml-64 min-h-screen w-full">
             <!-- Top Bar -->
-            <header class="sticky top-0 z-30 bg-white/80 backdrop-blur-md border-b border-slate-200 px-6 py-3 flex items-center justify-between">
-                <div>
-                    <h2 id="page-title" class="text-xl font-semibold text-slate-800">Dashboard</h2>
-                    <p id="page-subtitle" class="text-sm text-slate-500">Overview of your business</p>
+            <header class="sticky top-0 z-30 bg-white/80 backdrop-blur-md border-b border-slate-200 px-3 sm:px-6 py-3 flex items-center justify-between gap-2">
+                <div class="flex items-center gap-2 min-w-0">
+                    <button type="button" id="menu-toggle" class="lg:hidden w-10 h-10 rounded-lg hover:bg-slate-100 text-slate-700 flex items-center justify-center flex-shrink-0" onclick="toggleSidebar()" aria-label="Open menu">
+                        <i class="fas fa-bars text-lg"></i>
+                    </button>
+                    <div class="min-w-0">
+                        <h2 id="page-title" class="text-lg sm:text-xl font-semibold text-slate-800 truncate">Dashboard</h2>
+                        <p id="page-subtitle" class="text-sm text-slate-500 hidden sm:block">Overview of your business</p>
+                    </div>
                 </div>
-                <div class="flex items-center gap-4">
-                    <div class="text-right hidden sm:block">
+                <div class="flex items-center gap-2 sm:gap-4 flex-shrink-0">
+                    <div class="text-right hidden md:block">
                         <p id="current-date" class="text-sm font-medium text-slate-700"></p>
                         <p id="current-time" class="text-xs text-slate-400"></p>
                     </div>
-                    <div class="w-px h-8 bg-slate-200"></div>
-                    <button id="quick-bill-btn" class="btn-primary text-white text-sm font-medium px-4 py-2 rounded-lg flex items-center gap-2">
+                    <div class="w-px h-8 bg-slate-200 hidden md:block"></div>
+                    <button id="quick-bill-btn" class="btn-primary text-white text-sm font-medium px-3 sm:px-4 py-2 rounded-lg flex items-center gap-2">
                         <i class="fas fa-plus"></i>
-                        <span>New Bill</span>
+                        <span class="hidden xs:inline sm:inline">New Bill</span>
                     </button>
                 </div>
             </header>
@@ -559,7 +608,7 @@
 
     <script>
         // ==================== DATA & STATE ====================
-        const APP_VERSION = '1.2.0';
+        const APP_VERSION = '1.3.0';
 
         const STORAGE_KEY = 'zero_device_pos_data';
         
@@ -615,6 +664,18 @@
             // Public warranty QR deep link — works without login, using Firebase only.
             // Short-circuits the whole POS app and renders just the warranty report.
             if (tryRenderPublicWarrantyLink()) return;
+
+            // If Firebase already connected, refresh from cloud in background
+            if (state.settings.firebase?.connected && state.settings.firebase?.config) {
+                loadAllDataFromFirebase().then(ok => {
+                    if (ok) {
+                        const active = document.querySelector('.sidebar-item.active');
+                        if (active && !document.getElementById('main-app').classList.contains('hidden')) {
+                            navigateTo(active.dataset.page || 'dashboard');
+                        }
+                    }
+                }).catch(() => {});
+            }
             
             // Ensure default admin exists
             if (state.users.length === 0) {
@@ -738,24 +799,99 @@
         }
 
 
-        function saveData() {
+        function getPosSnapshot() {
+            return {
+                products: state.products,
+                customers: state.customers,
+                bills: state.bills,
+                warranties: state.warranties,
+                users: state.users,
+                settings: state.settings,
+                nextProductId: state.nextProductId,
+                nextBillId: state.nextBillId,
+                nextCustomerId: state.nextCustomerId,
+                nextWarrantyId: state.nextWarrantyId,
+                updatedAt: new Date().toISOString(),
+                version: APP_VERSION
+            };
+        }
+
+        function saveData(opts) {
+            opts = opts || {};
             try {
-                const toSave = {
-                    products: state.products,
-                    customers: state.customers,
-                    bills: state.bills,
-                    warranties: state.warranties,
-                    users: state.users,
-                    settings: state.settings,
-                    nextProductId: state.nextProductId,
-                    nextBillId: state.nextBillId,
-                    nextCustomerId: state.nextCustomerId,
-                    nextWarrantyId: state.nextWarrantyId
-                };
+                const toSave = getPosSnapshot();
                 localStorage.setItem(STORAGE_KEY, JSON.stringify(toSave));
             } catch (e) {
                 console.error('Failed to save data:', e);
                 showToast('Failed to save data', 'error');
+            }
+            // Cloud sync (all POS data) when Firebase is connected
+            if (!opts.skipCloud && state.settings.firebase?.connected) {
+                syncAllDataToFirebase().catch(err => console.warn('Cloud sync failed', err));
+            }
+        }
+
+        async function syncAllDataToFirebase() {
+            if (!state.settings.firebase?.connected) return false;
+            const snap = getPosSnapshot();
+            // Avoid writing huge base64 images that blow Firestore 1MB limit: keep images, but if payload too big strip pageHtml from warranties
+            const light = JSON.parse(JSON.stringify(snap));
+            if (light.warranties) {
+                light.warranties.forEach(w => { delete w.pageHtml; });
+            }
+            // Strip firebase nested cycle / keep config
+            try {
+                const payload = {
+                    ...light,
+                    syncedAt: new Date().toISOString()
+                };
+                // Firestore document size limit ~1MB — store as one snapshot doc
+                await firestoreSetDocument('pos_data', 'main', payload);
+                return true;
+            } catch (err) {
+                // Retry without product images if too large
+                try {
+                    const lighter = JSON.parse(JSON.stringify(light));
+                    (lighter.products || []).forEach(p => {
+                        if (p.image && String(p.image).startsWith('data:')) p.image = '';
+                    });
+                    (lighter.bills || []).forEach(b => {
+                        (b.items || []).forEach(it => {
+                            if (it.image && String(it.image).startsWith('data:')) it.image = '';
+                        });
+                    });
+                    await firestoreSetDocument('pos_data', 'main', { ...lighter, syncedAt: new Date().toISOString(), imagesStripped: true });
+                    return true;
+                } catch (err2) {
+                    console.warn('Full cloud sync failed', err2);
+                    return false;
+                }
+            }
+        }
+
+        async function loadAllDataFromFirebase() {
+            if (!state.settings.firebase?.config?.projectId) return false;
+            try {
+                const data = await firestoreGetDocument('pos_data', 'main');
+                if (!data) return false;
+                if (data.products) state.products = data.products;
+                if (data.customers) state.customers = data.customers;
+                if (data.bills) state.bills = data.bills;
+                if (data.warranties) state.warranties = data.warranties;
+                if (data.users && data.users.length) state.users = data.users;
+                if (data.settings) {
+                    const fbKeep = state.settings.firebase;
+                    state.settings = { ...state.settings, ...data.settings, firebase: fbKeep || data.settings.firebase };
+                }
+                if (data.nextProductId) state.nextProductId = data.nextProductId;
+                if (data.nextBillId) state.nextBillId = data.nextBillId;
+                if (data.nextCustomerId) state.nextCustomerId = data.nextCustomerId;
+                if (data.nextWarrantyId) state.nextWarrantyId = data.nextWarrantyId;
+                saveData({ skipCloud: true });
+                return true;
+            } catch (err) {
+                console.warn('Load from Firebase failed', err);
+                return false;
             }
         }
 
@@ -863,6 +999,7 @@
 
         // ==================== NAVIGATION ====================
         function navigateTo(page) {
+            closeSidebar();
             document.querySelectorAll('.sidebar-item').forEach(btn => {
                 btn.classList.remove('active');
                 btn.classList.add('text-slate-600');
@@ -992,6 +1129,27 @@
             const prefix = state.settings.invoicePrefix || 'ZD';
             const num = String(state.nextBillId).padStart(5, '0');
             return `${prefix}-${num}`;
+        }
+
+        // ==================== MOBILE SIDEBAR ====================
+        function toggleSidebar() {
+            const sb = document.getElementById('sidebar');
+            const ov = document.getElementById('sidebar-overlay');
+            if (!sb) return;
+            const open = sb.classList.toggle('open');
+            if (ov) ov.classList.toggle('show', open);
+        }
+        function closeSidebar() {
+            const sb = document.getElementById('sidebar');
+            const ov = document.getElementById('sidebar-overlay');
+            if (sb) sb.classList.remove('open');
+            if (ov) ov.classList.remove('show');
+        }
+        function openSidebar() {
+            const sb = document.getElementById('sidebar');
+            const ov = document.getElementById('sidebar-overlay');
+            if (sb) sb.classList.add('open');
+            if (ov) ov.classList.add('show');
         }
 
         // ==================== DASHBOARD ====================
@@ -2994,9 +3152,21 @@ ${isCancelled ? '.card{opacity:.92} .banner{background:#fef2f2;color:#b91c1c;pad
                     connected: true,
                     lastConnectedAt: new Date().toISOString()
                 };
-                saveData();
-                showToast('Firebase connected successfully!', 'success');
-                setTimeout(() => resyncPendingWarranties(), 400);
+                saveData({ skipCloud: true });
+                showToast('Firebase connected — syncing data...', 'success');
+                // Pull cloud snapshot if exists, else push local
+                (async () => {
+                    const loaded = await loadAllDataFromFirebase();
+                    if (loaded) {
+                        showToast('Cloud data loaded to this device', 'success');
+                    } else {
+                        await syncAllDataToFirebase();
+                        showToast('Local data uploaded to Firebase', 'success');
+                    }
+                    await resyncPendingWarranties();
+                    const active = document.querySelector('.sidebar-item.active');
+                    if (active) navigateTo(active.dataset.page || 'dashboard');
+                })();
             } catch (err) {
                 console.warn('Firebase connect failed', err);
                 state.settings.firebase = {
@@ -3012,15 +3182,43 @@ ${isCancelled ? '.card{opacity:.92} .banner{background:#fef2f2;color:#b91c1c;pad
         }
 
         function disconnectFirebase() {
-            if (!confirm('Disconnect Firebase? Warranty QR online check work aagathu until reconnect.')) return;
+            if (!confirm('Disconnect Firebase? Cloud sync and warranty QR online check will stop until reconnect.')) return;
             state.settings.firebase = {
                 config: state.settings.firebase?.config || null,
                 connected: false,
                 lastConnectedAt: state.settings.firebase?.lastConnectedAt || null
             };
-            saveData();
+            saveData({ skipCloud: true });
             showToast('Firebase disconnected', 'info');
             renderSettings();
+        }
+
+        async function manualCloudSync() {
+            if (!state.settings.firebase?.connected) {
+                showToast('Connect Firebase first', 'warning');
+                return;
+            }
+            showToast('Uploading all data to Firebase...', 'info');
+            const ok = await syncAllDataToFirebase();
+            if (ok) showToast('All data synced to cloud', 'success');
+            else showToast('Cloud sync failed — check rules for pos_data', 'error');
+        }
+
+        async function manualCloudPull() {
+            if (!state.settings.firebase?.connected) {
+                showToast('Connect Firebase first', 'warning');
+                return;
+            }
+            if (!confirm('Pull cloud data to this device? Local data will be replaced with cloud copy.')) return;
+            showToast('Downloading from Firebase...', 'info');
+            const ok = await loadAllDataFromFirebase();
+            if (ok) {
+                showToast('Cloud data loaded', 'success');
+                const active = document.querySelector('.sidebar-item.active');
+                navigateTo(active?.dataset?.page || 'dashboard');
+            } else {
+                showToast('No cloud data found or pull failed', 'warning');
+            }
         }
 
         async function resyncPendingWarranties() {
@@ -3359,7 +3557,7 @@ body{font-family:system-ui,-apple-system,sans-serif;background:#f1f5f9;color:#1e
                             <span class="icon-wrap"><i class="fas fa-fire"></i></span>
                             <span>
                                 <span class="block text-sm">Firebase Connection</span>
-                                <span class="block text-xs font-normal text-slate-400">Powers online warranty storage & QR lookup</span>
+                                <span class="block text-xs font-normal text-slate-400">Full POS cloud sync + warranty QR</span>
                             </span>
                             <i class="fas fa-chevron-down chevron"></i>
                         </button>
@@ -3373,7 +3571,7 @@ body{font-family:system-ui,-apple-system,sans-serif;background:#f1f5f9;color:#1e
                                         <li>Project settings → Your apps → copy the full <code>firebaseConfig</code> object and paste below → Connect</li>
                                         <li>Host this POS page on <strong>http/https</strong> (not file://) so customer phone can open the QR link</li>
                                     </ol>
-                                    <p class="mt-2">Only warranty reports go online. Products, sales, customers stay in this browser (local).</p>
+                                    <p class="mt-2">When connected, <strong>all POS data</strong> (products, customers, bills, warranties, users, settings) syncs to Firebase. Warranty QR still works online for customers.</p>
                                 </div>
                                 <div>
                                     <label class="block text-xs font-medium text-slate-500 mb-1">Firebase Config</label>
@@ -3394,6 +3592,12 @@ body{font-family:system-ui,-apple-system,sans-serif;background:#f1f5f9;color:#1e
                                         <i class="fas fa-plug mr-2"></i>${fb.connected ? 'Reconnect' : 'Connect'}
                                     </button>
                                     ${fb.connected ? `
+                                    <button type="button" onclick="manualCloudSync()" class="animated-btn px-4 py-2.5 rounded-lg border border-primary-200 text-primary-700 text-sm font-medium hover:bg-primary-50">
+                                        <i class="fas fa-cloud-upload-alt mr-2"></i>Sync Now
+                                    </button>
+                                    <button type="button" onclick="manualCloudPull()" class="animated-btn px-4 py-2.5 rounded-lg border border-slate-200 text-slate-700 text-sm font-medium hover:bg-slate-50">
+                                        <i class="fas fa-cloud-download-alt mr-2"></i>Pull from Cloud
+                                    </button>
                                     <button type="button" onclick="disconnectFirebase()" class="animated-btn px-4 py-2.5 rounded-lg border border-red-200 text-red-600 text-sm font-medium hover:bg-red-50">
                                         <i class="fas fa-unlink mr-2"></i>Disconnect
                                     </button>` : ''}
@@ -3407,6 +3611,9 @@ service cloud.firestore {
       allow read, write: if true;
     }
     match /_meta/{doc} {
+      allow read, write: if true;
+    }
+    match /pos_data/{doc} {
       allow read, write: if true;
     }
   }
@@ -3474,7 +3681,7 @@ service cloud.firestore {
                         </button>
                         <div class="settings-body">
                             <p class="text-sm text-slate-500 mb-3 pt-2">
-                                Data is stored in this browser. Export backups regularly. Warranty reports are additionally stored securely in Firebase when connected.
+                                Data is stored in this browser and synced to Firebase when connected (so phone & computer stay in sync). Export backups regularly.
                             </p>
                             <div class="flex flex-wrap gap-3">
                                 <button onclick="exportData()" class="animated-btn px-4 py-2.5 rounded-lg border border-slate-200 text-sm font-medium text-slate-700 hover:bg-slate-50 flex items-center gap-2">
@@ -3519,7 +3726,7 @@ service cloud.firestore {
                                 <div>
                                     <h3 class="font-semibold text-slate-800 mb-1">Zero Device POS</h3>
                                     <p class="text-sm text-slate-600 leading-relaxed mb-2">${s.businessDescription || ''}</p>
-                                    <p class="text-xs text-slate-400">POS System v${APP_VERSION} · Local storage + Firebase-powered warranty verification</p>
+                                    <p class="text-xs text-slate-400">POS System v${APP_VERSION} · Local + full Firebase cloud sync · Mobile ready</p>
                                 </div>
                             </div>
                         </div>
