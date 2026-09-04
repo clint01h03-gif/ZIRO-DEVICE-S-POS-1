@@ -248,7 +248,7 @@
             #invoice-print-area .invoice-header-accent { height: 4px !important; }
             #invoice-print-area table { page-break-inside: avoid; font-size: 11px !important; }
             #invoice-print-area .sign-row { page-break-inside: avoid; margin-top: 10px !important; }
-            #invoice-qr-code img, #invoice-qr-code canvas { width: 56px !important; height: 56px !important; }
+            #invoice-qr-code img, #invoice-qr-code canvas { width: 96px !important; height: 96px !important; }
         }
 
         /* Layered "3D box" styling for the invoice */
@@ -1852,8 +1852,8 @@
                             </div>
                             <!-- QR Code next to shop name / location -->
                             <div class="flex flex-col items-center flex-shrink-0">
-                                <div id="invoice-qr-code" class="bg-white p-1 rounded-lg border-2 border-primary-100 invoice-3d" style="width:72px;height:72px;"></div>
-                                <p class="text-[8px] text-slate-400 mt-1 text-center max-w-[72px] leading-tight">Scan for Warranty</p>
+                                <div id="invoice-qr-code" class="bg-white p-1.5 rounded-lg border-2 border-primary-100 invoice-3d" style="width:120px;height:120px;"></div>
+                                <p class="text-[9px] text-slate-400 mt-1.5 text-center max-w-[120px] leading-tight font-medium">Scan for Warranty</p>
                             </div>
                         </div>
 
@@ -2014,18 +2014,18 @@
                     try {
                         new QRCode(qrEl, {
                             text: qrText,
-                            width: 64,
-                            height: 64,
+                            width: 112,
+                            height: 112,
                             colorDark: '#0b3f6e',
                             colorLight: '#ffffff',
-                            correctLevel: QRCode.CorrectLevel.M
+                            correctLevel: QRCode.CorrectLevel.H
                         });
                     } catch (e) {
                         qrEl.innerHTML = '<span class="text-[9px] text-slate-400 p-2">QR unavailable</span>';
                     }
                 } else if (qrEl) {
                     const data = encodeURIComponent(qrText);
-                    qrEl.innerHTML = `<img src="https://api.qrserver.com/v1/create-qr-code/?size=64x64&data=${data}&color=0b3f6e" width="64" height="64" alt="QR" style="display:block;">`;
+                    qrEl.innerHTML = `<img src="https://api.qrserver.com/v1/create-qr-code/?size=112x112&data=${data}&color=0b3f6e" width="112" height="112" alt="QR" style="display:block;">`;
                 }
             }, 80);
         }
